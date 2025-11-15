@@ -3,6 +3,9 @@ from typing import List
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
+import polars as pl
+from setuptools.command.alias import alias
 
 from configs.configs import DataConfig
 
@@ -19,55 +22,33 @@ def _extract_axis_array_from_ts(ts_df: pd.DataFrame, axis: str) -> np.ndarray:
         return np.array([])
 
     array = np.asarray(ts_df[axis])
-    return array.reshape(-1,)
+    return array.reshape(-1, )
 
 
-def load_data_raw(prefix_path: str) -> pd.DataFrame:
-    df_columns = ['subject_id', 'device', 'sensor', 'label', 'timestamp', 'x', 'y', 'z']
+def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) -> pl.LazyFrame:
     file_header = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
 
-    seperate_df: List[pd.DataFrame] = []
-    total_files = 0
+    paths = list(Path(prefix_path).rglob("data_*.txt"))
 
-    for device in ('phone', 'watch'):
-        for sensor in ('accel', 'gyro'):
-            dirpath = os.path.join(prefix_path, device, sensor)
-            if not os.path.isdir(dirpath):
-                print(f"warning: directory not found: {dirpath}")
-                continue
-
-            with os.scandir(dirpath) as iterator_for_directory:
-                entries = [entry for entry in iterator_for_directory if entry.is_file()]
-
-            for entry in entries[:2]:
-                entry_path = entry.path
-                try:
-                    # low_memory=False helps pandas parse mixed types faster (fewer dtype passes)
-                    file_dataframe = pd.read_csv(entry_path, header=None, names=file_header, low_memory=False)
-                except Exception as e:
-                    print(f"failed to read {entry_path}: {e}")
-                    continue
-
-                file_dataframe['device'] = device
-                file_dataframe['sensor'] = sensor
-                seperate_df.append(file_dataframe)
-                total_files += 1
-
-    if not seperate_df:
-        print("warning: unable to read any data")
-        return pd.DataFrame(columns=df_columns)
-
-    result = pd.concat(seperate_df, ignore_index=True)
-
-    print(f"Loaded {total_files} files -> {len(result):,} rows")
-    return result
+    lf_all = []
+    for p in paths:
+        lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header)
+        subject_id, sensor, device = str(p).removesuffix(".txt").split('_')[-3:]
+        lf = lf.drop(["subject_id", "timestamp"])
+        lf = lf.group_by("label", maintain_order=True).all()
+        lf = lf.with_columns(pl.lit(sensor).alias("sensor"))
+        lf = lf.with_columns(pl.lit(device).alias("device"))
+        lf = lf.with_columns(pl.lit(subject_id).alias("subject_id"))
+        lf_all.append(lf)
+    lf_all = pl.concat(lf_all)
+    return lf_all
 
 
-def convert_raw_data_to_10_second_timeseries(data: pd.DataFrame) -> pd.DataFrame:
+def convert_data_to_10_seconds_intervals(data: pl.LazyFrame) -> pd.DataFrame:
     # for each 'subject_id', 'device', 'sensor', 'label', create a dataframe of 'timestamp', 'x', 'y', 'z'
     assert data is not None and not data.empty, "timeseries cannot be computed for None or empty"
     assert all(col in data.columns for col in
-        ['subject_id', 'device', 'sensor', 'label', 'timestamp', 'x', 'y', 'z']), \
+               ['subject_id', 'device', 'sensor', 'label', 'timestamp', 'x', 'y', 'z']), \
         "DataFrame for timeseries must contain required columns"
     data = data.copy()
     separate_df = []
@@ -83,7 +64,7 @@ def convert_raw_data_to_10_second_timeseries(data: pd.DataFrame) -> pd.DataFrame
             segment = inner_df.iloc[start:end].reset_index(drop=True)
             outer_df = pd.DataFrame(
                 {'subject_id': [group_keys[0]], 'device': [group_keys[1]], 'sensor': [group_keys[2]],
-                    'label': [group_keys[3]], 'timeseries': [segment]})
+                 'label': [group_keys[3]], 'timeseries': [segment]})
             separate_df.append(outer_df)
     result = pd.concat(separate_df, ignore_index=True)
     print(f"Converted to timeseries format -> {len(result):,} rows")
@@ -161,7 +142,8 @@ def convert_timeseries_to_features(data: pd.DataFrame) -> pd.DataFrame:
 if __name__ == "__main__":
     data_path_prefix = "/Users/wojtek/Library/Mobile Documents/com~apple~CloudDocs/Documents/EPRS/WISDM/data/wisdm-dataset/raw"
 
-    data = load_data_raw(data_path_prefix)
-    data = convert_raw_data_to_10_second_timeseries(data)
+    data = load_data_raw_with_row_per_sensor_device_activity_subject(data_path_prefix)
+    exit()
+    data = convert_data_to_10_seconds_intervals(data)
     data = convert_timeseries_to_features(data)
     print(data.head())
