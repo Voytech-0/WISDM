@@ -40,35 +40,37 @@ def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) 
         lf = lf.with_columns(pl.lit(device).alias("device"))
         lf = lf.with_columns(pl.lit(subject_id).alias("subject_id"))
         lf_all.append(lf)
+
     lf_all = pl.concat(lf_all)
     return lf_all
 
 
-def convert_data_to_10_seconds_intervals(data: pl.LazyFrame) -> pd.DataFrame:
+def convert_data_to_10_seconds_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
     # for each 'subject_id', 'device', 'sensor', 'label', create a dataframe of 'timestamp', 'x', 'y', 'z'
-    assert data is not None and not data.empty, "timeseries cannot be computed for None or empty"
-    assert all(col in data.columns for col in
-               ['subject_id', 'device', 'sensor', 'label', 'timestamp', 'x', 'y', 'z']), \
+    assert lf is not None, "timeseries cannot be computed for None or empty"
+    assert set(lf.collect_schema().names()) == {'subject_id', 'device', 'sensor', 'label', 'x', 'y', 'z'}, \
         "DataFrame for timeseries must contain required columns"
-    data = data.copy()
-    separate_df = []
-    group_columns = ['subject_id', 'device', 'sensor', 'label']
-    data_grouped = data.groupby(group_columns)
-    for group_keys, group_data in data_grouped:
-        group_data_sorted = group_data.sort_values(by='timestamp')
-        inner_df = group_data_sorted[['timestamp', 'x', 'y', 'z']].reset_index(drop=True)
 
-        segment_size = DataConfig.feature_length_in_seconds * DataConfig.frequency
-        for start in range(0, len(inner_df), segment_size):
-            end = start + segment_size
-            segment = inner_df.iloc[start:end].reset_index(drop=True)
-            outer_df = pd.DataFrame(
-                {'subject_id': [group_keys[0]], 'device': [group_keys[1]], 'sensor': [group_keys[2]],
-                 'label': [group_keys[3]], 'timeseries': [segment]})
-            separate_df.append(outer_df)
-    result = pd.concat(separate_df, ignore_index=True)
-    print(f"Converted to timeseries format -> {len(result):,} rows")
-    return result
+    chunk_size = DataConfig.feature_length_in_seconds * DataConfig.frequency
+    group_columns = ['subject_id', 'device', 'sensor', 'label']
+
+    result_lf = (
+        lf
+        .explode(["x", "y", "z"])
+        .with_columns(
+            pl.int_range(pl.len()).over(group_columns).alias("series_idx")
+        )
+        .with_columns(
+            (pl.col("series_idx") // chunk_size).alias("chunk_idx"),
+        )
+        .group_by(
+            group_columns + ["chunk_idx"], maintain_order=True
+        )
+        .all()
+        .drop(['chunk_idx', 'series_idx'])
+    )
+
+    return result_lf
 
 
 def apply_z_score_normalization(data: pd.DataFrame) -> pd.DataFrame:
@@ -143,7 +145,8 @@ if __name__ == "__main__":
     data_path_prefix = "/Users/wojtek/Library/Mobile Documents/com~apple~CloudDocs/Documents/EPRS/WISDM/data/wisdm-dataset/raw"
 
     data = load_data_raw_with_row_per_sensor_device_activity_subject(data_path_prefix)
-    exit()
+    # print(data.collect())
     data = convert_data_to_10_seconds_intervals(data)
+    exit()
     data = convert_timeseries_to_features(data)
     print(data.head())
