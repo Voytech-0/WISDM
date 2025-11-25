@@ -1,167 +1,160 @@
-import os
-from typing import List
-
 import numpy as np
 import pandas as pd
+from pathlib import Path
+import sys
+import polars as pl
+
+# When tests import this file directly, the repo root may not be on sys.path.
+# Prepend the repository root so `configs.configs` can be resolved.
+repo_root = Path(__file__).resolve().parents[2]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 from configs.configs import DataConfig
 
 
-def _extract_axis_array_from_ts(ts_df: pd.DataFrame, axis: str) -> np.ndarray:
-    """
-    Return a 1-D numpy array of values for `axis` from a timeseries DataFrame.
-    """
-    if not isinstance(ts_df, pd.DataFrame):
-        return np.array([])
-    if axis not in ts_df.columns:
-        return np.array([])
-    if len(ts_df) == 0:
-        return np.array([])
-
-    array = np.asarray(ts_df[axis])
-    return array.reshape(-1,)
-
-
-def load_data_raw(prefix_path: str) -> pd.DataFrame:
-    df_columns = ['subject_id', 'device', 'sensor', 'label', 'timestamp', 'x', 'y', 'z']
+def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) -> pl.LazyFrame:
     file_header = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
 
-    seperate_df: List[pd.DataFrame] = []
-    total_files = 0
+    paths = list(Path(prefix_path).rglob("data_*.txt"))
 
-    for device in ('phone', 'watch'):
-        for sensor in ('accel', 'gyro'):
-            dirpath = os.path.join(prefix_path, device, sensor)
-            if not os.path.isdir(dirpath):
-                print(f"warning: directory not found: {dirpath}")
-                continue
+    lf_all = []
+    for p in paths:
+        lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char=";")
+        subject_id, sensor, device = str(p).removesuffix(".txt").split('_')[-3:]
+        lf = (
+            lf
+            .drop(["subject_id", "timestamp"])
+            .group_by("label", maintain_order=True).all()
+            .with_columns(
+                (pl.lit(sensor).alias("sensor")),
+                (pl.lit(device).alias("device")),
+                (pl.lit(subject_id).alias("subject_id")),
+            )
+        )
+        lf_all.append(lf)
 
-            with os.scandir(dirpath) as iterator_for_directory:
-                entries = [entry for entry in iterator_for_directory if entry.is_file()]
+    lf_all = pl.concat(lf_all).drop_nulls()
 
-            for entry in entries[:2]:
-                entry_path = entry.path
-                try:
-                    # low_memory=False helps pandas parse mixed types faster (fewer dtype passes)
-                    file_dataframe = pd.read_csv(entry_path, header=None, names=file_header, low_memory=False)
-                except Exception as e:
-                    print(f"failed to read {entry_path}: {e}")
-                    continue
-
-                file_dataframe['device'] = device
-                file_dataframe['sensor'] = sensor
-                seperate_df.append(file_dataframe)
-                total_files += 1
-
-    if not seperate_df:
-        print("warning: unable to read any data")
-        return pd.DataFrame(columns=df_columns)
-
-    result = pd.concat(seperate_df, ignore_index=True)
-
-    print(f"Loaded {total_files} files -> {len(result):,} rows")
-    return result
+    return lf_all
 
 
-def convert_raw_data_to_10_second_timeseries(data: pd.DataFrame) -> pd.DataFrame:
+def convert_data_to_10_seconds_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
     # for each 'subject_id', 'device', 'sensor', 'label', create a dataframe of 'timestamp', 'x', 'y', 'z'
-    assert data is not None and not data.empty, "timeseries cannot be computed for None or empty"
-    assert all(col in data.columns for col in
-        ['subject_id', 'device', 'sensor', 'label', 'timestamp', 'x', 'y', 'z']), \
-        "DataFrame for timeseries must contain required columns"
-    data = data.copy()
-    separate_df = []
+    assert lf is not None, "timeseries cannot be computed for None or empty"
+    names = set(lf.collect_schema().names())
+    required = {'subject_id', 'device', 'sensor', 'label', 'x', 'y', 'z'}
+    assert required.issubset(names), "DataFrame for timeseries must contain required columns"
+
+    chunk_size = DataConfig.feature_length_in_seconds * DataConfig.frequency
     group_columns = ['subject_id', 'device', 'sensor', 'label']
-    data_grouped = data.groupby(group_columns)
-    for group_keys, group_data in data_grouped:
-        group_data_sorted = group_data.sort_values(by='timestamp')
-        inner_df = group_data_sorted[['timestamp', 'x', 'y', 'z']].reset_index(drop=True)
 
-        segment_size = DataConfig.feature_length_in_seconds * DataConfig.frequency
-        for start in range(0, len(inner_df), segment_size):
-            end = start + segment_size
-            segment = inner_df.iloc[start:end].reset_index(drop=True)
-            outer_df = pd.DataFrame(
-                {'subject_id': [group_keys[0]], 'device': [group_keys[1]], 'sensor': [group_keys[2]],
-                    'label': [group_keys[3]], 'timeseries': [segment]})
-            separate_df.append(outer_df)
-    result = pd.concat(separate_df, ignore_index=True)
-    print(f"Converted to timeseries format -> {len(result):,} rows")
-    return result
+    result_lf = (
+        lf
+        .explode(["x", "y", "z"])
+        .with_columns(
+            pl.int_range(pl.len()).over(group_columns).alias("series_idx")
+        )
+        .with_columns(
+            (pl.col("series_idx") // chunk_size).alias("chunk_idx"),
+        )
+        .group_by(
+            group_columns + ["chunk_idx"], maintain_order=True,
+        )
+        .all()
+        .filter(
+            (pl.col("chunk_idx") + 1) * chunk_size == (pl.col("series_idx").list.last() + 1)
+        )
+        .drop(['chunk_idx', 'series_idx'])
+    )
+    return result_lf
 
 
-def apply_z_score_normalization(data: pd.DataFrame) -> pd.DataFrame:
+def apply_z_score_normalization(lf: pl.LazyFrame) -> pl.LazyFrame:
     """
-    Normalize each axis (x,y,z) per device and sensor using z-score.
+    Normalize each axis (x,y,z) per device, sensor, participant using z-score.
     """
-    assert data is not None and not data.empty, "z-score cannot be computed for None or empty"
-    assert 'timeseries' in data.columns, "DataFrame for z-score must contain 'timeseries' column"
-    data = data.copy()
+    assert lf is not None
 
-    devices = data['device'].unique()
-    sensors = data['sensor'].unique()
+    group_columns = ['subject_id', 'device', 'sensor']
 
-    for device in devices:
-        for sensor in sensors:
-            mask = (data['device'] == device) & (data['sensor'] == sensor)
-            subset = data.loc[mask]
+    stats = (
+        lf
+        .select(group_columns + ['x', 'y', 'z'])
+        .explode(['x', 'y', 'z'])
+        .group_by(group_columns)
+        .agg([
+            pl.col('x').mean().alias('x_mean'),
+            pl.col('y').mean().alias('y_mean'),
+            pl.col('z').mean().alias('z_mean'),
+            pl.col('x').std().alias('x_std'),
+            pl.col('y').std().alias('y_std'),
+            pl.col('z').std().alias('z_std'),
+        ])
+    )
 
-            if subset.empty:
-                continue
+    lf_norm = (
+        lf
+        .with_columns(pl.arange(0, pl.len()).alias('row_idx'))
+        .join(stats, on=group_columns, how='left')
+        .with_columns([
+            pl.when(pl.col('x_std').is_null() | (pl.col('x_std') == 0)).then(1.0).otherwise(pl.col('x_std')).alias(
+                'x_std_safe'),
+            pl.when(pl.col('y_std').is_null() | (pl.col('y_std') == 0)).then(1.0).otherwise(pl.col('y_std')).alias(
+                'y_std_safe'),
+            pl.when(pl.col('z_std').is_null() | (pl.col('z_std') == 0)).then(1.0).otherwise(pl.col('z_std')).alias(
+                'z_std_safe'),
+        ])
+        .explode(['x', 'y', 'z'])
+        .with_columns([
+            ((pl.col('x').cast(pl.Float64) - pl.col('x_mean')) / pl.col('x_std_safe')).alias('x'),
+            ((pl.col('y').cast(pl.Float64) - pl.col('y_mean')) / pl.col('y_std_safe')).alias('y'),
+            ((pl.col('z').cast(pl.Float64) - pl.col('z_mean')) / pl.col('z_std_safe')).alias('z'),
+        ])
+        .group_by('row_idx')
+        .agg(
+            pl.first('subject_id').alias('subject_id'),
+            pl.first('device').alias('device'),
+            pl.first('sensor').alias('sensor'),
+            pl.first('label').alias('label'),
+            pl.col('x').alias('x'),
+            pl.col('y').alias('y'),
+            pl.col('z').alias('z'),
+        )
+        .drop('row_idx')
+    )
 
-            axis_stats = {}
-            for axis in ['x', 'y', 'z']:
-                # collect arrays for this axis from each timeseries DataFrame using the helper
-                axis_arrays = subset['timeseries'].apply(lambda ts: _extract_axis_array_from_ts(ts, axis))
+    return lf_norm
 
-                non_empty = [a for a in axis_arrays.to_list() if a.size > 0]
-                if len(non_empty) == 0:
-                    continue
-                all_values = np.concatenate(non_empty, axis=0)
-
-                if all_values.size == 0:
-                    mean = 0.0
-                    std = 1.0
-                else:
-                    mean = float(np.mean(all_values))
-                    std = float(np.std(all_values))
-                    if std == 0.0:
-                        std = 1.0
-
-                axis_stats[axis] = (mean, std)
-
-            if not axis_stats:
-                continue
-
-            # Apply normalization to each timeseries dataframe in the subset
-            def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-                df = df.copy()
-                for axis, (mean, std) in axis_stats.items():
-                    if axis in df.columns:
-                        df[axis] = (df[axis] - mean) / std
-                return df
-
-            normalized_series = subset['timeseries'].apply(normalize_df)
-            data.loc[mask, 'timeseries'] = normalized_series.values
-
-    return data
+def source_target_split(lf: pl.LazyFrame, target_prefix = "label"):
+    all_column_names = lf.collect_schema().names()
+    label_cols = [col for col in all_column_names if col.startswith(target_prefix)]
+    feature_cols = [col for col in all_column_names if col not in label_cols]
+    return lf.select(feature_cols), lf.select(label_cols)
 
 
-def convert_timeseries_to_features(data: pd.DataFrame) -> pd.DataFrame:
-    assert data is not None and not data.empty, "features cannot be computed for None or empty"
+def preprocessing_pipeline_for_wisdm_raw_data(data_path_to_raw_folder):
+    """
 
-    if 'subject_id' in data.columns:
-        data = data.drop(columns=['subject_id'])
+    :param data_path_to_raw_folder:
+    :return:
+    """
 
-    data = apply_z_score_normalization(data)
+    lf = load_data_raw_with_row_per_sensor_device_activity_subject(data_path_to_raw_folder)
+    # print(data.collect())
+    # print(lf.collect())
+    lf = convert_data_to_10_seconds_intervals(lf)
+    # print(lf.collect())
+    lf = apply_z_score_normalization(lf)
+    # lf = one_hot_encode(lf, ["device", "sensor", "label"])
+    # DataFrame from LazyFrame
+    df = lf.collect()
+    df = df.to_dummies(columns=["device", "sensor", "label"])
 
-    return data
+    return df
 
 
 if __name__ == "__main__":
     data_path_prefix = "/Users/wojtek/Library/Mobile Documents/com~apple~CloudDocs/Documents/EPRS/WISDM/data/wisdm-dataset/raw"
-
-    data = load_data_raw(data_path_prefix)
-    data = convert_raw_data_to_10_second_timeseries(data)
-    data = convert_timeseries_to_features(data)
-    print(data.head())
+    df = preprocessing_pipeline_for_wisdm_raw_data(data_path_prefix)
+    print(df)
