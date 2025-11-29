@@ -1,5 +1,11 @@
 from dataclasses import dataclass
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+project_root = Path(__file__).resolve().parents[1]
+dotenv_path = project_root / ".env"
+load_dotenv(dotenv_path)
 
 @dataclass(init=False, frozen=True)
 class PathsConfig:

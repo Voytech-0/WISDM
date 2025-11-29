@@ -27,3 +27,6 @@ pymysql==1.1.0
 
 # Health endpoint
 Flask
+
+# Load .env support for local development and Docker init utils
+python-dotenv==1.2.1

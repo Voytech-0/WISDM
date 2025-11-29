@@ -1,8 +1,7 @@
-import pandas as pd
 from pathlib import Path
 import sys
 import polars as pl
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 # When tests import this file directly, the repo root may not be on sys.path.
 # Prepend the repository root so `configs.configs` can be resolved.
@@ -13,73 +12,54 @@ if str(repo_root) not in sys.path:
 from configs.configs import DataConfig, PathsConfig, MySQLConfig
 
 
-def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) -> pl.LazyFrame:
+def load_data_raw_with_row_per_sensor_device_activity_subject() -> pl.LazyFrame:
     """
-    Attempt to load data from local MySQL database using credentials in `configs.configs.MySQLConfig`.
-    If the database is not reachable or the table is missing, fall back to loading from the raw files
-    located under `prefix_path` (original behaviour).
     Returns a polars LazyFrame where each row corresponds to one (subject_id, device, sensor, label)
     and the columns x,y,z are lists of values ordered by timestamp.
     """
-    # First, try to connect to the local MySQL and read grouped rows
-    try:
-        engine = create_engine(
-            f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
-        )
-        query = "SELECT subject_id, label, timestamp, x, y, z, sensor, device FROM wisdm_raw"
-        df = pd.read_sql(query, con=engine)
+    engine = create_engine(
+        f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
+    )
+    query = "SELECT subject_id, label, timestamp, x, y, z, sensor, device FROM wisdm_raw"
 
-        if df.empty:
-            raise RuntimeError("Query returned no rows")
+    with engine.connect() as conn:
+        result = conn.execute(text(query))
+        rows = result.fetchall()
+        cols = result.keys()
 
-        # Ensure types and drop incomplete rows
-        for c in ['timestamp', 'x', 'y', 'z']:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-        df = df.dropna(subset=['z'])
+    if not rows:
+        raise RuntimeError("Query returned no rows")
 
-        # sort by timestamp to preserve ordering
-        df = df.sort_values(['subject_id', 'device', 'sensor', 'label', 'timestamp'])
+    df = pl.DataFrame(rows, schema=list(cols))
 
-        grouped = (
-            df.groupby(['subject_id', 'device', 'sensor', 'label'], sort=False)
-            .agg({'x': lambda s: list(s), 'y': lambda s: list(s), 'z': lambda s: list(s)})
-            .reset_index()
-        )
+    # Ensure numeric types for timestamp,x,y,z and drop incomplete rows
+    df = df.with_columns([
+        pl.col('timestamp').cast(pl.Float64).alias('timestamp'),
+        pl.col('x').cast(pl.Float64).alias('x'),
+        pl.col('y').cast(pl.Float64).alias('y'),
+        pl.col('z').cast(pl.Float64).alias('z'),
+    ]).filter(pl.col('z').is_not_null())
 
-        lf = pl.from_pandas(grouped).lazy()
-        # grouped columns are Python lists; Polars will treat them as List type already.
-        # Return the lazy frame directly so downstream code can explode/operate on the lists.
-        return lf
+    # sort by timestamp to preserve ordering within groups
+    df = df.sort(['subject_id', 'device', 'sensor', 'label', 'timestamp'])
 
-    except Exception:
-        # Fall back to original local file reading behaviour
-        file_header = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
+    # group and aggregate x,y,z into lists (maintain order)
+    grouped = (
+        df
+        .groupby(['subject_id', 'device', 'sensor', 'label'], maintain_order=True)
+        .agg([
+            pl.col('x').alias('x'),
+            pl.col('y').alias('y'),
+            pl.col('z').alias('z'),
+        ])
+    )
 
-        paths = list(Path(prefix_path).rglob("data_*.txt"))
+    return grouped.lazy()
 
-        lf_all = []
-        for p in paths:
-            lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char=";")
-            subject_id, sensor, device = str(p).removesuffix(".txt").split('_')[-3:]
-            lf = (
-                lf
-                .drop(["subject_id", "timestamp"])
-                .group_by("label", maintain_order=True).all()
-                .with_columns(
-                    (pl.lit(sensor).alias("sensor")),
-                    (pl.lit(device).alias("device")),
-                    (pl.lit(subject_id).alias("subject_id")),
-                )
-            )
-            lf_all.append(lf)
-
-        lf_all = pl.concat(lf_all).drop_nulls()
-
-        return lf_all
 
 
 def convert_data_to_10_seconds_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
-    # for each 'subject_id', 'device', 'sensor', 'label', create a dataframe of 'timestamp', 'x', 'y', 'z'
+    # for each 'subject_id', 'device' 'sensor', 'label', create lists of', 'x', 'y', 'z'
     assert lf is not None, "timeseries cannot be computed for None or empty"
     names = set(lf.collect_schema().names())
     required = {'subject_id', 'device', 'sensor', 'label', 'x', 'y', 'z'}
@@ -224,11 +204,6 @@ def expand_lists(df, list_cols):
 
 
 def preprocessing_pipeline_for_wisdm_raw_data(data_path_to_raw_folder):
-    """
-
-    :param data_path_to_raw_folder:
-    :return:
-    """
 
     lf = load_data_raw_with_row_per_sensor_device_activity_subject(data_path_to_raw_folder)
     # print(data.collect())
@@ -245,6 +220,5 @@ def preprocessing_pipeline_for_wisdm_raw_data(data_path_to_raw_folder):
 
 
 if __name__ == "__main__":
-    data_path_prefix = "/Users/wojtek/Library/Mobile Documents/com~apple~CloudDocs/Documents/EPRS/WISDM/data/wisdm-dataset/raw"
-    df = preprocessing_pipeline_for_wisdm_raw_data(data_path_prefix)
+    df = preprocessing_pipeline_for_wisdm_raw_data()
     print(df)
