@@ -1,0 +1,67 @@
+services:
+
+  app:
+
+    image: wisdm:latest
+    command: python src/main.py
+
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      # ensure db_init starts before app; health is handled by app's own healthcheck which queries db_init
+      db_init:
+        condition: service_started
+    # app no longer needs a shared init volume; it will query db_init directly at http://db_init:5000/health
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8000/health || exit 1"]
+      interval: 5s
+      retries: 30
+      start_period: 10s
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.3.0rc0
+    command: mlflow server --host 0.0.0.0 --port 8080
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: apt-get update -y && apt-get install -y curl && curl --fail http://localhost:8080 || exit 1
+      retries: 3
+      interval: 5s
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: "wisdm"
+      MYSQL_USER: "user"
+      MYSQL_PASSWORD: "password"
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      retries: 5
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  db_init:
+    image: python:3.11-slim
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace:delegated
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+      MYSQL_DATABASE: wisdm
+      WISDM_RAW_PATH: /workspace/data/wisdm-dataset/raw
+    depends_on:
+      mysql:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", "python src/db_init_server.py & pip install --no-cache-dir -r requirements-db-init.txt && python scripts/populate_db.py && touch /tmp/db_init_complete && wait"]
+
+volumes:
+  mysql_data:

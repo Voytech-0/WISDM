@@ -1,8 +1,8 @@
-import numpy as np
 import pandas as pd
 from pathlib import Path
 import sys
 import polars as pl
+from sqlalchemy import create_engine
 
 # When tests import this file directly, the repo root may not be on sys.path.
 # Prepend the repository root so `configs.configs` can be resolved.
@@ -10,33 +10,72 @@ repo_root = Path(__file__).resolve().parents[2]
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
-from configs.configs import DataConfig
+from configs.configs import DataConfig, PathsConfig, MySQLConfig
 
 
 def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) -> pl.LazyFrame:
-    file_header = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
-
-    paths = list(Path(prefix_path).rglob("data_*.txt"))
-
-    lf_all = []
-    for p in paths:
-        lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char=";")
-        subject_id, sensor, device = str(p).removesuffix(".txt").split('_')[-3:]
-        lf = (
-            lf
-            .drop(["subject_id", "timestamp"])
-            .group_by("label", maintain_order=True).all()
-            .with_columns(
-                (pl.lit(sensor).alias("sensor")),
-                (pl.lit(device).alias("device")),
-                (pl.lit(subject_id).alias("subject_id")),
-            )
+    """
+    Attempt to load data from local MySQL database using credentials in `configs.configs.MySQLConfig`.
+    If the database is not reachable or the table is missing, fall back to loading from the raw files
+    located under `prefix_path` (original behaviour).
+    Returns a polars LazyFrame where each row corresponds to one (subject_id, device, sensor, label)
+    and the columns x,y,z are lists of values ordered by timestamp.
+    """
+    # First, try to connect to the local MySQL and read grouped rows
+    try:
+        engine = create_engine(
+            f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
         )
-        lf_all.append(lf)
+        query = "SELECT subject_id, label, timestamp, x, y, z, sensor, device FROM wisdm_raw"
+        df = pd.read_sql(query, con=engine)
 
-    lf_all = pl.concat(lf_all).drop_nulls()
+        if df.empty:
+            raise RuntimeError("Query returned no rows")
 
-    return lf_all
+        # Ensure types and drop incomplete rows
+        for c in ['timestamp', 'x', 'y', 'z']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df = df.dropna(subset=['z'])
+
+        # sort by timestamp to preserve ordering
+        df = df.sort_values(['subject_id', 'device', 'sensor', 'label', 'timestamp'])
+
+        grouped = (
+            df.groupby(['subject_id', 'device', 'sensor', 'label'], sort=False)
+            .agg({'x': lambda s: list(s), 'y': lambda s: list(s), 'z': lambda s: list(s)})
+            .reset_index()
+        )
+
+        lf = pl.from_pandas(grouped).lazy()
+        # grouped columns are Python lists; Polars will treat them as List type already.
+        # Return the lazy frame directly so downstream code can explode/operate on the lists.
+        return lf
+
+    except Exception:
+        # Fall back to original local file reading behaviour
+        file_header = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
+
+        paths = list(Path(prefix_path).rglob("data_*.txt"))
+
+        lf_all = []
+        for p in paths:
+            lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char=";")
+            subject_id, sensor, device = str(p).removesuffix(".txt").split('_')[-3:]
+            lf = (
+                lf
+                .drop(["subject_id", "timestamp"])
+                .group_by("label", maintain_order=True).all()
+                .with_columns(
+                    (pl.lit(sensor).alias("sensor")),
+                    (pl.lit(device).alias("device")),
+                    (pl.lit(subject_id).alias("subject_id")),
+                )
+            )
+            lf_all.append(lf)
+
+        lf_all = pl.concat(lf_all).drop_nulls()
+
+        return lf_all
 
 
 def convert_data_to_10_seconds_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -70,28 +109,48 @@ def convert_data_to_10_seconds_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
     return result_lf
 
 
-def apply_z_score_normalization(lf: pl.LazyFrame) -> pl.LazyFrame:
+def get_z_score_stats() -> pl.LazyFrame:
+    file_path = PathsConfig.z_score_params_path
+    if Path(file_path).exists():
+        stats = pl.read_pickle(file_path)
+        return stats
+    else:
+        raise FileNotFoundError(f"Z-score stats file not found at {file_path}")
+
+
+def set_z_score_stats(stats: pl.LazyFrame):
+    file_path = PathsConfig.z_score_params_path
+    stats.collect().write_csv(file_path)
+
+
+def apply_z_score_normalization(lf: pl.LazyFrame, train: bool = False, group_columns=None) -> pl.LazyFrame:
     """
     Normalize each axis (x,y,z) per device, sensor, participant using z-score.
     """
     assert lf is not None
 
-    group_columns = ['subject_id', 'device', 'sensor']
+    if group_columns is None:
+        group_columns = ['device', 'sensor']
 
-    stats = (
-        lf
-        .select(group_columns + ['x', 'y', 'z'])
-        .explode(['x', 'y', 'z'])
-        .group_by(group_columns)
-        .agg([
-            pl.col('x').mean().alias('x_mean'),
-            pl.col('y').mean().alias('y_mean'),
-            pl.col('z').mean().alias('z_mean'),
-            pl.col('x').std().alias('x_std'),
-            pl.col('y').std().alias('y_std'),
-            pl.col('z').std().alias('z_std'),
-        ])
-    )
+    if train:
+        stats = (
+            lf
+            .select(group_columns + ['x', 'y', 'z'])
+            .explode(['x', 'y', 'z'])
+            .group_by(group_columns)
+            .agg([
+                pl.col('x').mean().alias('x_mean'),
+                pl.col('y').mean().alias('y_mean'),
+                pl.col('z').mean().alias('z_mean'),
+                pl.col('x').std().alias('x_std'),
+                pl.col('y').std().alias('y_std'),
+                pl.col('z').std().alias('z_std'),
+            ])
+        )
+        set_z_score_stats(stats)
+    else:
+        stats = get_z_score_stats()
+
 
     lf_norm = (
         lf
@@ -126,11 +185,42 @@ def apply_z_score_normalization(lf: pl.LazyFrame) -> pl.LazyFrame:
 
     return lf_norm
 
-def source_target_split(lf: pl.LazyFrame, target_prefix = "label"):
-    all_column_names = lf.collect_schema().names()
+def source_target_split(df: pl.DataFrame, target_prefix ="label"):
+    all_column_names = df.collect_schema().names()
     label_cols = [col for col in all_column_names if col.startswith(target_prefix)]
     feature_cols = [col for col in all_column_names if col not in label_cols]
-    return lf.select(feature_cols), lf.select(label_cols)
+    return df.select(feature_cols), df.select(label_cols)
+
+def generate_splits(df: pl.DataFrame):
+    # split using DataConfig.train_split, DataConfig.validation_split and DataConfig.test_split
+    n = df.height
+    train_end = int(n * DataConfig.train_split)
+    val_end = train_end + int(n * DataConfig.validation_split)
+    df_train = df.slice(0, train_end)
+    df_val = df.slice(train_end, val_end - train_end)
+    df_test = df.slice(val_end, n - val_end)
+    output_dict = {}
+    for split in ['train', 'validation', 'test']:
+        if split == 'train':
+            df_split = df_train
+        elif split == 'validation':
+            df_split = df_val
+        else:
+            df_split = df_test
+        X, y = source_target_split(df_split)
+        output_dict[split] = {'X': X, 'y': y}
+    return output_dict
+
+
+def expand_lists(df, list_cols):
+
+    max_len = DataConfig.feature_length_in_seconds * DataConfig.frequency
+    new_cols = []
+    for i in range(max_len):
+        for c in list_cols:
+            new_cols.append(pl.col(c).arr.get(i).alias(f"{c}_{i}"))
+
+    return df.with_columns(new_cols).drop(list_cols)
 
 
 def preprocessing_pipeline_for_wisdm_raw_data(data_path_to_raw_folder):
@@ -150,7 +240,7 @@ def preprocessing_pipeline_for_wisdm_raw_data(data_path_to_raw_folder):
     # DataFrame from LazyFrame
     df = lf.collect()
     df = df.to_dummies(columns=["device", "sensor", "label"])
-
+    df = expand_lists(df, ["x", "y", "z"])
     return df
 
 
