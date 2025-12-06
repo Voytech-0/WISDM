@@ -68,6 +68,5 @@ class TrainingConfig:
     num_layers: int = int(os.getenv('NUM_LAYERS', '1'))
     num_classes: int = int(os.getenv('NUM_CLASSES', '6'))
     # model directory and default checkpoint path
-    model_dir: str = str(project_root / 'models')
-    model_path: str = str(project_root / 'models' / 'lstm.ckpt')
-
+    model_dir: str = os.getenv('MODEL_DIR', str(project_root / 'models'))
+    model_path: str = os.getenv('MODEL_PATH', str(project_root / 'models' / 'lstm.ckpt'))

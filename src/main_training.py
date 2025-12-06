@@ -6,7 +6,6 @@ from flask import Flask, request, jsonify
 
 import random
 import numpy as np
-import pandas as pd
 import torch
 import polars as pl
 from typing import Tuple
@@ -16,6 +15,7 @@ import pytorch_lightning as torchl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from configs.configs import TrainingConfig
 from preprocessing.preprocess import preprocessing_pipeline_for_wisdm_raw_data
+import shutil
 
 # configure basic logging for CLI/info output
 logging.basicConfig(level=logging.INFO)
@@ -26,8 +26,8 @@ try:
     seed_val = TrainingConfig.seed
 except Exception:
     # fall back to a simple default if CFG doesn't provide seed
-    logging.warning("TrainingConfig.seed not found, using default seed 25")
-    seed_val = 25
+    logging.warning("TrainingConfig.seed not found, using default seed 44")
+    seed_val = 44
 
 torchl.seed_everything(seed_val)
 torch.manual_seed(seed_val)
@@ -87,14 +87,12 @@ class SequenceDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-class LittleLSTM(torchl.LightningModule):
+class LittleMLP(torchl.LightningModule):
     def __init__(self, input_size, hidden_size, num_layers, num_classes, lr):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
-        # Replace LSTM with a simple MLP. Keep constructor signature for compatibility
-        # We'll lazily build the MLP on first forward pass since the flattened input dim
-        # depends on whether the dataset provides (batch, seq_len, feat) or (batch, feat).
+        self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.num_classes = num_classes
@@ -102,19 +100,21 @@ class LittleLSTM(torchl.LightningModule):
         self.dropout = nn.Dropout(p=0.3)
         self.criterion = nn.CrossEntropyLoss()
 
-    def _build_mlp(self, input_dim: int):
-        """Create an MLP dynamically given the flattened input dimension."""
         layers = []
-        in_dim = input_dim
+        # ensure hyperparams are normal python ints (helps static checkers and downstream ops)
+        num_layers = int(self.num_layers)
+        hidden_size = int(self.hidden_size)
+        num_layers = max(1, num_layers)
         # create `num_layers` hidden layers using hidden_size
-        for i in range(max(1, self.num_layers)):
-            layers.append(nn.Linear(in_dim, self.hidden_size))
-            layers.append(nn.BatchNorm1d(self.hidden_size))
+        in_dim = input_size
+        for i in range(num_layers):
+            layers.append(nn.Linear(in_dim, hidden_size))
+            layers.append(nn.BatchNorm1d(hidden_size))
             layers.append(nn.ReLU(inplace=True))
             layers.append(self.dropout)
-            in_dim = self.hidden_size
+            in_dim = hidden_size
         # final classifier
-        layers.append(nn.Linear(in_dim, self.num_classes))
+        layers.append(nn.Linear(in_dim, int(self.num_classes)))
         self.net = nn.Sequential(*layers)
         # register the module so it's saved/loaded with checkpoints
         self.add_module("net", self.net)
@@ -195,121 +195,49 @@ def cli():
 @click.option("--lr", default=TrainingConfig.lr, type=float)
 @click.option("--checkpoint", default=None, help="Optional path to resume checkpoint")
 def train(epochs, batch_size, lr, checkpoint):
-    """Train the LSTM model"""
+    """Train the model"""
     data = preprocessing_pipeline_for_wisdm_raw_data()
 
     train_loader, val_loader, _ = make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1)
 
     input_size = data.width - len([col for col in data.columns if col.startswith("label")])
 
-    model = LittleLSTM(input_size=input_size, hidden_size=TrainingConfig.hidden_size,
-                       num_layers=TrainingConfig.num_layers, num_classes=TrainingConfig.num_classes, lr=lr)
+    model = LittleMLP(input_size=input_size, hidden_size=TrainingConfig.hidden_size,
+                      num_layers=TrainingConfig.num_layers, num_classes=TrainingConfig.num_classes, lr=lr)
 
-    checkpoint_cb = ModelCheckpoint(dirpath=str(TrainingConfig.model_dir), filename="lstm", save_top_k=1, monitor="val_loss", mode="min")
+    # ensure model dir exists
+    model_dir_path = Path(TrainingConfig.model_dir)
+    model_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Keep only the best checkpoint (save_top_k=1). We'll copy that best checkpoint to TrainingConfig.model_path
+    checkpoint_cb = ModelCheckpoint(dirpath=str(model_dir_path), filename="lstm", save_top_k=1, monitor="val_loss", mode="min")
     trainer = torchl.Trainer(max_epochs=epochs, callbacks=[checkpoint_cb], logger=True, enable_checkpointing=True)
     trainer.fit(model, train_loader, val_loader, ckpt_path=checkpoint)
-    # save final checkpoint path to config path
-    ckpt = checkpoint_cb.best_model_path or ""
-    if ckpt:
-        logging.info(f"Best checkpoint saved at: {ckpt}")
-    else:
-        # if no checkpoint callback for some reason, save manually
-        trainer.save_checkpoint(str(TrainingConfig.model_path))
-        logging.info(f"Checkpoint saved at: {TrainingConfig.model_path}")
 
-
-@cli.command()
-@click.option("--checkpoint", required=True, help="Path to checkpoint (.ckpt)")
-@click.option("--input", "input_csv", required=True, help="CSV with a single row or multiple rows to infer")
-def infer(checkpoint, input_csv):
-    """Run inference on a CSV and print predictions as JSON"""
-    checkpoint = Path(checkpoint)
-    input_csv = Path(input_csv)
-    if not checkpoint.exists():
-        logging.error(f"Checkpoint not found: {checkpoint}")
-        raise click.ClickException(f"Checkpoint not found: {checkpoint}")
-    if not input_csv.exists():
-        logging.error(f"Input CSV not found: {input_csv}")
-        raise click.ClickException(f"Input CSV not found: {input_csv}")
-
-    # load model
-    model = LittleLSTM.load_from_checkpoint(str(checkpoint), input_size=TrainingConfig.input_size,
-                                            hidden_size=TrainingConfig.hidden_size, num_layers=TrainingConfig.num_layers,
-                                            num_classes=TrainingConfig.num_classes, lr=TrainingConfig.lr)
-    model.eval()
-    # load CSV with polars and build dataset
-    df = pl.read_csv(str(input_csv))
-    ds = SequenceDataset(df)
-    loader = DataLoader(ds, batch_size=TrainingConfig.batch_size)
-    results = []
-    with torch.no_grad():
-        for batch in loader:
-            if isinstance(batch, tuple):
-                x, _ = batch
-            else:
-                x = batch
-            logits = model(x.float())
-            probs = nn.functional.softmax(logits, dim=1).cpu().numpy()
-            preds = np.argmax(probs, axis=1).tolist()
-            for p, pr in zip(preds, probs.tolist()):
-                results.append({"pred": int(p), "probs": pr})
-    logging.info(json.dumps(results))
-
-
-def build_flask_app(checkpoint_path):
-    app = Flask(__name__)
-    if not Path(checkpoint_path).exists():
-        logging.error(f"Checkpoint not found: {checkpoint_path}")
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    model = LittleLSTM.load_from_checkpoint(str(checkpoint_path), input_size=TrainingConfig.input_size,
-                                            hidden_size=TrainingConfig.hidden_size, num_layers=TrainingConfig.num_layers,
-                                            num_classes=TrainingConfig.num_classes, lr=TrainingConfig.lr)
-    model.eval()
-
-    def prepare_input_from_json(data_json):
-        # Accept { "x": [...], "y": [...], "z":[...] } or arrays of such objects
-        def one(obj):
-            x = obj.get("x")
-            y = obj.get("y")
-            z = obj.get("z")
-            if x is None or y is None or z is None:
-                raise ValueError("Each input must contain x,y,z arrays")
-            arr = np.stack([np.array(x, dtype=np.float32), np.array(y, dtype=np.float32), np.array(z, dtype=np.float32)], axis=-1)
-            # arr shape (seq_len, 3) -> expand to (1, seq_len, 3)
-            return arr
-        if isinstance(data_json, list):
-            arrs = [one(o) for o in data_json]
-            return torch.from_numpy(np.stack(arrs, axis=0))
-        else:
-            return torch.from_numpy(np.expand_dims(one(data_json), axis=0))
-
-    @app.route("/predict", methods=["POST"])
-    def predict():
+    # copy best checkpoint (if available) to deterministic path from config
+    best_ckpt = checkpoint_cb.best_model_path
+    if best_ckpt:
         try:
-            payload = request.get_json(force=True)
-            x_tensor = prepare_input_from_json(payload)
-            with torch.no_grad():
-                logits = model(x_tensor.float())
-                probs = nn.functional.softmax(logits, dim=1).cpu().numpy().tolist()
-                preds = np.argmax(probs, axis=1).tolist()
-            out = [{"pred": int(p), "probs": pr} for p, pr in zip(preds, probs)]
-            return jsonify(out)
+            dest = Path(TrainingConfig.model_path)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(best_ckpt, str(dest))
+            logging.info(f"Best checkpoint copied to configured model_path: {dest}")
         except Exception as e:
-            logging.error("Error during /predict: %s", e, exc_info=True)
-            return jsonify({"error": str(e)}), 400
+            logging.error("Failed to copy best checkpoint to configured model_path: %s", e, exc_info=True)
+            # fallback: still try to save trainer checkpoint to configured path
+            try:
+                trainer.save_checkpoint(str(TrainingConfig.model_path))
+                logging.info(f"Fallback checkpoint saved at: {TrainingConfig.model_path}")
+            except Exception as e2:
+                logging.error("Fallback save also failed: %s", e2, exc_info=True)
+    else:
+        # No best model found (maybe training didn't run any validation); save last checkpoint to configured path
+        try:
+            trainer.save_checkpoint(str(TrainingConfig.model_path))
+            logging.info(f"Checkpoint saved at: {TrainingConfig.model_path}")
+        except Exception as e:
+            logging.error("Failed to save checkpoint to configured model_path: %s", e, exc_info=True)
 
-    return app
-
-
-@cli.command()
-@click.option("--checkpoint", required=True, help="Path to checkpoint (.ckpt)")
-@click.option("--host", default="127.0.0.1")
-@click.option("--port", default=5000, type=int)
-def serve(checkpoint, host, port):
-    """Start a Flask server exposing /predict"""
-    app = build_flask_app(checkpoint)
-    logging.info(f"Serving model {checkpoint} on http://{host}:{port}")
-    app.run(host=host, port=port)
 
 
 if __name__ == "__main__":

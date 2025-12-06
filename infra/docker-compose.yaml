@@ -47,7 +47,7 @@ services:
       context: ..
       dockerfile: infra/db_init/Dockerfile
     image: db-init:latest
-    command: ["python", "db_init/populate_db.py"]
+    command: flask --app db_init/populate_db run --host 0.0.0.0 --port 5001
     env_file:
       - ../.env
     ports:

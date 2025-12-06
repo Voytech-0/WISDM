@@ -10,6 +10,7 @@ import threading
 
 from configs.configs import MySQLConfig, DataConfig
 
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 FILE_HEADER = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
@@ -326,7 +327,7 @@ def populate(prefix_path: str = None):
 
     logging.info("Finished populating database")
 
-# minimal Flask API to expose status and start background populate
+logger.info("Starting flask app.")
 app = Flask(__name__)
 
 # On module import try to read persisted populated state from DB (best-effort, short timeout).
@@ -379,8 +380,3 @@ def populate_endpoint():
     return jsonify({'started': True}), HTTPStatus.ACCEPTED
 
 
-if __name__ == '__main__':
-    t = threading.Thread(target=_background_populate, daemon=True)
-    t.start()
-    # Run the Flask app to expose /status and /populate endpoints
-    app.run(host='0.0.0.0', port=5001)
