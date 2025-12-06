@@ -1,32 +1,13 @@
+aiohttp==3.13.2
 build==1.3.0
-click==8.3.1
-coverage @ file:///private/var/folders/c_/qfmhj66j0tn016nkx_th4hxm0000gp/T/abs_4bpe55w4x6/croot/coverage_1734018334319/work
-iniconfig==2.3.0
-numpy==2.3.5
-packaging @ file:///private/var/folders/c_/qfmhj66j0tn016nkx_th4hxm0000gp/T/abs_95hd3yozva/croot/packaging_1753775365688/work
+cryptography==46.0.3
+Flask==3.1.2
+opentelemetry-api==1.30.0
 pandas==2.3.3
-pandas-stubs @ file:///private/var/folders/c_/qfmhj66j0tn016nkx_th4hxm0000gp/T/abs_ca9dn5gsaq/croot/pandas-stubs_1742460573922/work
-pluggy @ file:///private/var/folders/sy/f16zz6x50xz3113nwtb9bvq00000gp/T/abs_70ykkrsb12/croot/pluggy_1733169619735/work
 polars==1.35.2
-polars-runtime-32==1.35.2
 pyarrow==22.0.0
-Pygments @ file:///private/var/folders/sy/f16zz6x50xz3113nwtb9bvq00000gp/T/abs_d3k0kb020b/croot/pygments_1744664134805/work
-pyproject_hooks==1.2.0
-pytest @ file:///private/var/folders/c_/qfmhj66j0tn016nkx_th4hxm0000gp/T/abs_c1usz7gn7j/croot/pytest_1750675204405/work
-python-dateutil==2.9.0.post0
-pytz==2025.2
-setuptools==72.1.0
-six==1.17.0
-types-pytz==2025.2.0.20251108
-tzdata==2025.2
-wheel==0.45.1
-
-# Added for DB population and SQL access
-SQLAlchemy==2.0.22
-pymysql==1.1.0
-
-# Health endpoint
-Flask
-
-# Load .env support for local development and Docker init utils
+PyMySQL==1.1.1
 python-dotenv==1.2.1
+pytorch-lightning==2.5.0.post0
+SQLAlchemy==2.0.44
+wheel==0.45.1

@@ -5,11 +5,11 @@ import pandas as pd
 import polars as pl
 import pytest
 from preprocessing.preprocess import (
-load_data_raw_with_row_per_sensor_device_activity_subject,
-convert_data_to_10_seconds_intervals,
-apply_z_score_normalization,
-source_target_split,
-preprocessing_pipeline_for_wisdm_raw_data
+  load_data_raw_with_row_per_sensor_device_activity_subject,
+  convert_data_to_10_seconds_intervals,
+  apply_z_score_normalization,
+  _source_target_split,
+  preprocessing_pipeline_for_wisdm_raw_data
 )
 
 
@@ -162,7 +162,7 @@ def test_source_target_split():
         }
     ]
     for case in cases:
-        features, labels = source_target_split(case["data"], target_prefix="label")
+        features, labels = _source_target_split(case["data"], target_prefix="label")
         pd.testing.assert_frame_equal(
             features.collect().to_pandas(),
             case["expected_features"].collect().to_pandas(),

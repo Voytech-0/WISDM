@@ -4,7 +4,7 @@ import logging
 import pandas as pd
 import polars as pl
 from sqlalchemy import create_engine, text
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
 from http import HTTPStatus
 import threading
 
@@ -16,7 +16,8 @@ FILE_HEADER = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
 
 def get_engine():
     url = f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
-    return create_engine(url)
+    # enable local_infile so we can use LOAD DATA LOCAL INFILE for much faster bulk loads when available
+    return create_engine(url, connect_args={"local_infile": 1})
 
 
 def wait_for_db(engine, timeout_s=60):
@@ -137,6 +138,10 @@ def parse_and_insert(engine, prefix_path: str):
         pl.col('z').cast(pl.Float64, strict=False),
     ])
 
+    # keep only 1000 first
+    # FIXME: use full dataset later
+    df_pl = df_pl.head(1000000)
+
     # Convert to pandas for the existing SQL insertion path
     logging.info("Converting Polars DataFrame to pandas for DB insertion...")
     df = df_pl.to_pandas()
@@ -152,13 +157,86 @@ def parse_and_insert(engine, prefix_path: str):
             df[c] = None
     df = df[expected_cols]
 
+    # Try a fast bulk insert using LOAD DATA LOCAL INFILE if possible; fall back to pandas.to_sql
     try:
-        logging.info(f"Appending {len(df)} rows to wisdm_raw)")
-        df.to_sql('wisdm_raw', con=engine, if_exists='append', index=False, method='multi')
-        logging.info(f"Appended {len(df)} rows to wisdm_raw.")
+        inserted = False
+        try:
+            inserted = insert_using_load_data(engine, df, table_name='wisdm_raw')
+        except Exception as e:
+            logging.debug(f"Fast bulk load failed or unavailable: {e}; falling back to pandas.to_sql")
+
+        if not inserted:
+            logging.info(f"Appending {len(df)} rows to wisdm_raw using pandas.to_sql")
+            # chunked multi-row insert to avoid huge single statements
+            df.to_sql('wisdm_raw', con=engine, if_exists='append', index=False, method='multi', chunksize=10000)
+            logging.info(f"Appended {len(df)} rows to wisdm_raw using pandas.to_sql.")
     except Exception as e:
         logging.exception(f"Failed to append aggregated data into DB: {e}")
         raise
+
+
+def insert_using_load_data(engine, df: 'pd.DataFrame', table_name: str = 'wisdm_raw') -> bool:
+    """Attempt to bulk-load the dataframe into MySQL using LOAD DATA LOCAL INFILE.
+
+    Returns True on success. Raises on fatal errors. If the server doesn't allow LOCAL INFILE
+    this function will raise and the caller will fall back to another method.
+    """
+    import tempfile
+    import os
+
+    if df.empty:
+        logging.info("DataFrame is empty, nothing to insert")
+        return True
+
+    # Write to a temporary CSV file. Use \N for NULLs which MySQL treats as NULL by default.
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='')
+    tmp_name = tmp.name
+    try:
+        # Use comma separator and quote minimal fields to be safe
+        df.to_csv(tmp_name, index=False, sep=',', na_rep='\\N', quoting=1)
+        tmp.close()
+
+        # Ensure path quoting for LOAD DATA
+        path_for_sql = tmp_name.replace('\\', '\\\\')
+
+        # Build column list matching our table schema; ensure order matches CSV header
+        cols = list(df.columns)
+        cols_sql = ','.join(f'`{c}`' for c in cols)
+
+        conn = None
+        cursor = None
+        try:
+            conn = engine.raw_connection()
+            cursor = conn.cursor()
+            # Use LOCAL because the file is on the client side
+            # Build the LOAD DATA LOCAL INFILE statement using format(); ENCLOSED BY '"' is escaped
+            sql = (
+                "LOAD DATA LOCAL INFILE '{}' INTO TABLE {} "
+                "FIELDS TERMINATED BY ',' ENCLOSED BY '\"' "
+                "LINES TERMINATED BY '\\n' IGNORE 1 LINES "
+                "({});"
+            ).format(path_for_sql, table_name, cols_sql)
+            logging.info(f"Running bulk LOAD DATA LOCAL INFILE for {len(df)} rows")
+            cursor.execute(sql)
+            conn.commit()
+            return True
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+    return False
 
 # module-level cached status and running flag
 _is_populated = False
@@ -229,6 +307,7 @@ def populate(prefix_path: str = None):
         parse_and_insert(engine, prefix_path)
         _set_populated(True)
         try:
+            logging.info("Putting is_populated flag to DB")
             set_status_in_db(engine, 'is_populated', '1')
         except Exception:
             logging.exception('Failed to persist is_populated flag to DB')
@@ -274,19 +353,34 @@ def _background_populate(prefix_path: str = None):
 def status_endpoint():
     return jsonify({'is_populated': is_populated(), 'is_running': is_running()}), HTTPStatus.OK
 
-@app.route('/populate', methods=['POST'])
+@app.route('/populate', methods=['GET'])
 def populate_endpoint():
     if is_running():
         return jsonify({'error': 'Populate already running'}), HTTPStatus.CONFLICT
 
-    data = request.get_json(silent=True) or {}
-    prefix = data.get('prefix_path')
+    # Prefer persisted status in DB if available
+    try:
+        engine = get_engine()
+        if wait_for_db(engine, timeout_s=5):
+            persisted = get_status_from_db(engine, 'is_populated')
+            if persisted in ('1', 'true', 'True'):
+                _set_populated(True)
+                return jsonify({'started': False, 'reason': 'already populated (persisted)'}), HTTPStatus.CONFLICT
+    except Exception:
+        logging.debug('Could not check persisted populate status; falling back to in-memory flag')
 
-    # start background job
-    t = threading.Thread(target=_background_populate, args=(prefix,), daemon=True)
+    # fall back to in-memory cached flag
+    if is_populated():
+        return jsonify({'started': False, 'reason': 'already populated (in-memory)'}), HTTPStatus.CONFLICT
+
+    # start background job using configured DataConfig path
+    t = threading.Thread(target=_background_populate, daemon=True)
     t.start()
     return jsonify({'started': True}), HTTPStatus.ACCEPTED
 
 
 if __name__ == '__main__':
-    populate()
+    t = threading.Thread(target=_background_populate, daemon=True)
+    t.start()
+    # Run the Flask app to expose /status and /populate endpoints
+    app.run(host='0.0.0.0', port=5001)
