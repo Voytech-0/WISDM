@@ -214,14 +214,18 @@ def train(epochs, batch_size, lr, checkpoint):
     trainer = torchl.Trainer(max_epochs=epochs, callbacks=[checkpoint_cb], logger=True, enable_checkpointing=True)
     trainer.fit(model, train_loader, val_loader, ckpt_path=checkpoint)
 
-    # copy best checkpoint (if available) to deterministic path from config
+    # copy the best checkpoint (if available) to deterministic path from config
     best_ckpt = checkpoint_cb.best_model_path
     if best_ckpt:
         try:
             dest = Path(TrainingConfig.model_path)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(best_ckpt, str(dest))
-            logging.info(f"Best checkpoint copied to configured model_path: {dest}")
+            best_path = Path(best_ckpt)
+            if best_path.resolve(strict=False) == dest.resolve(strict=False):
+                logging.info(f"Best checkpoint already at configured model_path: {dest}")
+            else:
+                shutil.copyfile(str(best_path), str(dest))
+                logging.info(f"Best checkpoint copied to configured model_path: {dest}")
         except Exception as e:
             logging.error("Failed to copy best checkpoint to configured model_path: %s", e, exc_info=True)
             # fallback: still try to save trainer checkpoint to configured path

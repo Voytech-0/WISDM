@@ -1,6 +1,6 @@
 from pathlib import Path
 import sys
-from typing import List
+from typing import List, Dict, Any
 
 import polars as pl
 from sqlalchemy import create_engine, text
@@ -301,12 +301,81 @@ def preprocessing_pipeline_for_wisdm_raw_data():
      lf = apply_z_score_normalization(lf, train=True)
      # lf = one_hot_encode(lf, ["device", "sensor", "label"])
      # DataFrame from LazyFrame
-     df = lf.collect()
-     df = df.to_dummies(columns=["device", "sensor", "label"])
-     df = df.drop('subject_id')
+     df = collect_and_dummify_drop_subject(lf)
      df = expand_lists(df, ["x", "y", "z"])
      logging.info("Preprocessing produced DataFrame with %d rows and %d columns", df.height, len(df.columns))
      return df
+
+
+def build_raw_lazyframe_from_items(items: List[Dict[str, Any]]) -> pl.LazyFrame:
+    """Build a Polars LazyFrame from a list of raw input dicts containing x,y,z lists and metadata.
+
+    Each item is expected to contain at least keys: 'x','y','z'. Optional metadata: 'device','sensor','subject_id','label'.
+    """
+    rows = []
+    for it in items:
+        device = it.get('device') or 'unknown'
+        sensor = it.get('sensor') or 'unknown'
+        subject_id = it.get('subject_id') or 'unknown'
+        label = it.get('label') if 'label' in it else None
+        # coerce numeric values - allow callers to raise if conversion fails
+        x = list(map(float, it['x']))
+        y = list(map(float, it['y']))
+        z = list(map(float, it['z']))
+        rows.append({'subject_id': subject_id, 'device': device, 'sensor': sensor, 'label': label, 'x': x, 'y': y, 'z': z})
+    df = pl.DataFrame(rows)
+    return df.lazy()
+
+
+def lazyframe_to_single_10s(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """Ensure each row has x,y,z lists exactly `feature_length_in_seconds * frequency` long.
+    Long lists are truncated, short lists are padded with nulls. Returns a LazyFrame.
+    """
+    desired_length = int(DataConfig.feature_length_in_seconds * DataConfig.frequency)
+    if lf is None:
+        raise ValueError("Input LazyFrame cannot be None")
+
+    # Ensure required columns exist
+    names = set(lf.collect_schema().names())
+    required = {'x', 'y', 'z'}
+    if not required.issubset(names):
+        raise AssertionError(f"LazyFrame must contain columns {required}, got {names}")
+
+    # Use list.to_array(max_len) which truncates longer lists and pads shorter lists with nulls.
+    # Cast back to List to preserve list-typed columns.
+    lf_fixed = lf.with_columns([
+        pl.col('x').list.to_array(desired_length).alias('x'),
+        pl.col('y').list.to_array(desired_length).alias('y'),
+        pl.col('z').list.to_array(desired_length).alias('z'),
+    ])
+
+    return lf_fixed
+
+
+
+
+def collect_and_dummify_drop_subject(lf: pl.LazyFrame) -> pl.DataFrame:
+    """Collect lazyframe to DataFrame, dummify device/sensor/label if present, and drop subject_id to match training pipeline."""
+    df = lf.collect()
+    dummy_cols = [c for c in ['device', 'sensor', 'label'] if c in df.columns]
+    if dummy_cols:
+        df = df.to_dummies(columns=dummy_cols)
+    if 'subject_id' in df.columns:
+        df = df.drop('subject_id')
+    return df
+
+
+def expand_raw_items_to_expanded_df(items: List[Dict[str, Any]]) -> pl.DataFrame:
+    """High-level helper: run raw items through chunking, normalization, collecting/dummify, and expansion.
+
+    Returns a Polars DataFrame with expanded scalar feature columns (x_0.., y_0.., z_0..)
+    """
+    lf = build_raw_lazyframe_from_items(items)
+    ls = lazyframe_to_single_10s(lf)
+    lf_norm = apply_z_score_normalization(lf, train=False, group_columns=['device', 'sensor'])
+    df_norm = collect_and_dummify_drop_subject(lf_norm)
+    df_expanded = expand_lists(df_norm, ['x', 'y', 'z'])
+    return df_expanded
 
 
 if __name__ == "__main__":
