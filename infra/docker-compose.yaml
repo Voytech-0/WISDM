@@ -2,9 +2,9 @@ services:
 
   app:
 
-    build:
-      context: ..
-      dockerfile: infra/build/Dockerfile
+#    build:
+#      context: ..
+#      dockerfile: infra/build/Dockerfile
     image: wisdm:latest
     command: python src/main_api.py serve 8000
     ports:
@@ -13,10 +13,8 @@ services:
       - ../.env
 
     depends_on:
-      mlflow:
-        condition: service_healthy
-#      db-init:
-#        condition: service_started # here we do not wait for full population of mysql.
+      db-init:
+        condition: service_started # here we do not wait for full population of mysql.
 
     healthcheck:
       test: ["CMD-SHELL", "curl --fail http://localhost:8000/health || exit 1"]
@@ -24,11 +22,44 @@ services:
       retries: 30
       start_period: 10s
 
-  mlflow:
-    image: ghcr.io/mlflow/mlflow:v3.3.0rc0
-    command: mlflow server --host 0.0.0.0 --port 8080
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    depends_on:
+      - prometheus_push_gateway
+    volumes:
+      - "./telemetry/prometheus.yml:/etc/prometheus/prometheus.yml"
+      - "./telemetry/alerts.yml:/etc/prometheus/alerts.yml"
     ports:
-      - "8080:8080"
+      - "9090:9090"
+    healthcheck:
+      test: wget http://localhost:9090/metrics -S -O - || exit 1
+      retries: 3
+      interval: 5s
+
+  prometheus_push_gateway:
+    image: prom/pushgateway:v1.11.1
+    ports:
+      - "9091:9091"
+    healthcheck:
+      test: wget http://localhost:9091/metrics -S -O - || exit 1
+      retries: 3
+      interval: 5s
+
+  airflow:
+    image: apache/airflow:3.1.0-python3.10
+    command: airflow standalone
+    ports:
+      - "4242:8080"  # note: We need to use a different port than 8080 as it is already assigned for mlflow.
+    environment:
+      - _AIRFLOW_DB_MIGRATE=true
+      - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=true  # note: Disabling authentication completely.
+    volumes:
+      - ./airflow/dags/:/opt/airflow/dags  # note: Normally you pass DAGs to Airflow in a different way, through CI. Like moving to a Cloud Storage Directory where Airflow is getting the DAGs from.
+      - /var/run/docker.sock:/var/run/docker.sock  # note: For local deployment: linking local docker to Airflow
+    healthcheck:
+      test: wget http://localhost:8080/api/v2/monitor/health -o /dev/null || exit 1  # note: wget downloads the file. I do not need it. So we move it to /dev/null
+      retries: 3
+      interval: 5s
 
   mysql:
     image: mysql:8.0
@@ -58,6 +89,29 @@ services:
       mysql:
         condition: service_healthy
 
+
+  grafana:
+    image: grafana/grafana:9.5.0
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    ports:
+      - "3000:3000"
+    volumes:
+      - "./telemetry/provisioning/:/etc/grafana/provisioning/"
+      - "./telemetry/dashboards/:/var/lib/grafana/dashboards/"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      prometheus_push_gateway:
+        condition: service_healthy
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1
+      interval: 10s
+      retries: 5
 
 volumes:
   mysql_data:

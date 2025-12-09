@@ -1,0 +1,165 @@
+{
+  "uid": "wisdmdashboard1",
+  "title": "WISDM Observability",
+  "tags": ["infra","telemetry","wisdm"],
+  "timezone": "browser",
+  "schemaVersion": 27,
+  "version": 1,
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "CPU Usage (%)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "100 * (1 - avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 6 }
+    },
+    {
+      "id": 2,
+      "title": "Memory Usage (%)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 6 }
+    },
+    {
+      "id": 3,
+      "title": "Request Rate (rps)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (job) (rate(http_requests_total[5m]))",
+          "legendFormat": "{{job}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 6 }
+    },
+    {
+      "id": 4,
+      "title": "5xx Error Rate (rps)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (job) (rate(http_requests_total{status=~\"5..\"}[5m]))",
+          "legendFormat": "{{job}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 6 }
+    },
+    {
+      "id": 5,
+      "title": "API Requests by Endpoint / Method / Status (total)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (endpoint, method, status) (rate(api_requests_total[5m]))",
+          "legendFormat": "{{endpoint}} {{method}} {{status}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 6 }
+    },
+    {
+      "id": 6,
+      "title": "Predict Requests: Success vs Error (total)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(predict_requests_total[5m]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 6 }
+    },
+    {
+      "id": 7,
+      "title": "Predict Request Rate (rps)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum(rate(predict_requests_total[1m]))",
+          "legendFormat": "predict_rps",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 18, "w": 12, "h": 6 }
+    },
+    {
+      "id": 8,
+      "title": "Request Latency (p50/p90/p99)",
+      "type": "timeseries",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(request_latency_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p50 {{endpoint}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum(rate(request_latency_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p90 {{endpoint}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(request_latency_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p99 {{endpoint}}",
+          "refId": "C"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 18, "w": 12, "h": 6 }
+    },
+    {
+      "id": 9,
+      "title": "Request Latency Heatmap (buckets)",
+      "type": "heatmap",
+      "datasource": "${datasource}",
+      "targets": [
+        {
+          "expr": "sum(rate(request_latency_seconds_bucket[5m])) by (le)",
+          "legendFormat": "{{le}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 6 }
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "links": []
+}

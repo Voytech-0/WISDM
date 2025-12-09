@@ -1,6 +1,6 @@
 from pathlib import Path
 import sys
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import polars as pl
 from sqlalchemy import create_engine, text
@@ -134,8 +134,11 @@ def convert_data_to_10_seconds_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
 def get_z_score_stats() -> pl.LazyFrame:
     file_path = PathsConfig.z_score_params_path
     if Path(file_path).exists():
-        stats = pl.read_pickle(file_path)
-        return stats
+        with open(file_path, 'rb') as f:
+            stats_df = pickle.load(f)
+        if isinstance(stats_df, pl.DataFrame):
+            return stats_df
+        return pl.DataFrame(stats_df)
     else:
         logging.error("Z-score stats file not found at %s", file_path)
         raise FileNotFoundError(f"Z-score stats file not found at {file_path}")

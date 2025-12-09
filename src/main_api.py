@@ -1,98 +1,117 @@
-import json
 import logging
+from http import HTTPStatus
 from pathlib import Path
+from time import perf_counter
+from typing import Any, List, Optional
+from functools import cache
 
 import click
 import numpy as np
 import torch
-from flask import request, jsonify, Flask
+from flask import request, jsonify, Flask, g
 from torch import nn
 import polars as pl
-from torch.utils.data import DataLoader
-
-from configs.configs import TrainingConfig
-from preprocessing.preprocess import expand_raw_items_to_expanded_df
-from main_training import LittleMLP, SequenceDataset
+from main_training import LittleMLP
+import threading
+import os
 
 
-@click.command()
-@click.option("--checkpoint", default=None, help="Path to checkpoint (.ckpt). If omitted, uses TrainingConfig.model_path")
-@click.option("--input", "input_csv", required=True, help="CSV with a single row or multiple rows to infer")
-def infer(checkpoint, input_csv):
-    """Run inference on a CSV and print predictions as JSON"""
-    if checkpoint is None:
-        checkpoint_path = Path(TrainingConfig.model_path)
-    else:
-        checkpoint_path = Path(checkpoint)
+class ModelLoader:
+    """Encapsulates model checkpoint loading.
 
-    input_csv = Path(input_csv)
-    if not checkpoint_path.exists():
-        logging.error(f"Checkpoint not found: {checkpoint_path}")
-        raise click.ClickException(f"Checkpoint not found: {checkpoint_path}")
-    if not input_csv.exists():
-        logging.error(f"Input CSV not found: {input_csv}")
-        raise click.ClickException(f"Input CSV not found: {input_csv}")
+    Usage:
+        loader = ModelLoader(path_or_none)
+        model = loader.load()
+    """
 
-    # load model; rely on checkpoint/hparams to reconstruct model
-    model = LittleMLP.load_from_checkpoint(str(checkpoint_path))
-    model.eval()
-    # load CSV with polars and build dataset
-    df = pl.read_csv(str(input_csv))
-    ds = SequenceDataset(df)
-    loader = DataLoader(ds, batch_size=TrainingConfig.batch_size)
-    results = []
-    with torch.no_grad():
-        for batch in loader:
-            if isinstance(batch, tuple):
-                x, _ = batch
-            else:
-                x = batch
-            logits = model(x.float())
-            probs = nn.functional.softmax(logits, dim=1).cpu().numpy()
-            preds = np.argmax(probs, axis=1).tolist()
-            for p, pr in zip(preds, probs.tolist()):
-                results.append({"pred": int(p), "probs": pr})
-    logging.info(json.dumps(results))
+    def __init__(self, checkpoint_path: Optional[str] = None, model_cls=LittleMLP):
+        self.checkpoint_path = (
+            Path(checkpoint_path) if checkpoint_path is not None else Path(TrainingConfig.model_path)
+        )
+        self.model_cls = model_cls
+        # synchronization for cache operations
+        self._lock = threading.RLock()
+
+    @staticmethod
+    @cache
+    def _load_cached(checkpoint_path_str: str, mtime: Optional[float], model_cls):
+        """Class-scoped cached loader.
+
+        Decorated with @cache so the cache sits directly on the method definition.
+        Cache key includes checkpoint path and mtime; when mtime changes a fresh
+        model will be loaded. Call `_load_cached.cache_clear()` to force reload.
+        """
+        model = model_cls.load_from_checkpoint(checkpoint_path_str)
+        model.eval()
+        return model
+
+    def validate(self) -> None:
+        if not self.checkpoint_path.exists():
+            logging.error("Checkpoint not found: %s", self.checkpoint_path)
+            raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
+
+    def _get_checkpoint_mtime(self) -> Optional[float]:
+        try:
+            return float(self.checkpoint_path.stat().st_mtime)
+        except Exception:
+            return None
+
+    def load(self, force_reload: bool = False) -> torch.nn.Module:
+        """Load the model from checkpoint and return it in eval mode.
+
+        Uses a module-level functools.cache to memoize the loaded model. The cache key
+        embeds the checkpoint file mtime so updates to the file cause a fresh load.
+        Passing `force_reload=True` clears the cache before loading.
+        """
+        with self._lock:
+            if force_reload:
+                # clear the cached loader to force a fresh load
+                try:
+                    # class-scoped cached function
+                    self._load_cached.cache_clear()
+                except Exception:
+                    pass
+
+            # ensure the checkpoint is present (raises FileNotFoundError if missing)
+            self.validate()
+            current_mtime = self._get_checkpoint_mtime()
+            # call the cached loader; when mtime changes the cache key differs
+            model = self._load_cached(str(self.checkpoint_path), current_mtime, self.model_cls)
+            return model
 
 
-def build_flask_app():
-    app = Flask(__name__)
-    checkpoint_path = TrainingConfig.model_path
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.exists():
-        logging.error(f"Checkpoint not found: {checkpoint_path}")
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+class InputPreparer:
+    """Prepare input tensors for the model from JSON payloads or expanded feature dicts.
 
-    # load model using checkpoint's saved hparams
-    model = LittleMLP.load_from_checkpoint(str(checkpoint_path))
-    model.eval()
+    The class mirrors the previous `prepare_input_from_json` logic but packages it
+    so it's testable and reusable.
+    """
 
-    def prepare_input_from_json(data_json):
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def _is_raw(obj: dict) -> bool:
+        # Raw mode if object contains keys 'x','y','z' with list-like values
+        return (
+            isinstance(obj, dict)
+            and 'x' in obj and 'y' in obj and 'z' in obj
+            and hasattr(obj['x'], '__iter__') and hasattr(obj['y'], '__iter__') and hasattr(obj['z'], '__iter__')
+        )
+
+    def prepare(self, data_json: Any, model: Optional[torch.nn.Module] = None) -> torch.Tensor:
         """Convert incoming JSON into a torch tensor matching training features.
 
-        Accepts either:
-        - A single object or list of objects with raw time-series fields: {"x": [...], "y": [...], "z": [...], "device": "phone", "sensor": "accel"}
-          The lists can be shorter/longer than the model's fixed length; padding/truncation and z-score normalization will be applied using the project's preprocessing utilities.
-        - A single object or list of objects where each object already contains expanded feature columns (e.g. x_0, x_1, ..., y_0, ..., z_0, ... and/or dummy columns for device/sensor/label). In that case the object is converted directly to a DataFrame and used as-is.
-
-        Returns a torch.FloatTensor shaped (batch, n_features) suitable to pass into the model.
+        Accepts either raw time-series objects with 'x','y','z' lists, or already-expanded
+        feature dicts. Returns a FloatTensor shaped (batch, n_features).
         """
 
-        def is_raw(obj: dict) -> bool:
-            # Raw mode if object contains keys 'x','y','z' with list-like values
-            return (
-                isinstance(obj, dict)
-                and 'x' in obj and 'y' in obj and 'z' in obj
-                and hasattr(obj['x'], '__iter__') and hasattr(obj['y'], '__iter__') and hasattr(obj['z'], '__iter__')
-            )
-
-        # normalize to list of objects
-        items = data_json if isinstance(data_json, list) else [data_json]
+        items: List[dict] = data_json if isinstance(data_json, list) else [data_json]
         if not items:
             raise ValueError("Empty input payload")
 
         # Branch: raw timeseries mode -> delegate to preprocess helpers
-        if all(is_raw(it) for it in items):
+        if all(self._is_raw(it) for it in items):
             df_expanded = expand_raw_items_to_expanded_df(items)
         else:
             # Assume items already contain flattened/expanded features. Convert to polars DataFrame directly.
@@ -108,58 +127,113 @@ def build_flask_app():
             raise ValueError("No feature columns found after preprocessing")
 
         X_np = df_expanded.select(feature_cols).to_numpy()
+
         # If the model saved expected input size in hparams, validate it matches the preprocessed features
         try:
             expected = None
-            if hasattr(model, 'hparams') and hasattr(model.hparams, 'input_size'):
-                expected = int(model.hparams.input_size)
-            elif hasattr(model, 'hparams') and 'input_size' in dict(model.hparams):
-                expected = int(dict(model.hparams)['input_size'])
-            if expected is not None:
-                if X_np.shape[1] != expected:
-                    raise ValueError(f"Preprocessed input has {X_np.shape[1]} features but model expects {expected} features. Ensure the incoming JSON can be converted to the same expanded feature layout used during training.")
+            if model is not None and hasattr(model, 'hparams'):
+                # model.hparams may be an argparse Namespace-like or dict-like object
+                if hasattr(model.hparams, 'input_size'):
+                    expected = int(model.hparams.input_size)
+                elif 'input_size' in dict(model.hparams):
+                    expected = int(dict(model.hparams)['input_size'])
+            if expected is not None and X_np.shape[1] != expected:
+                raise ValueError(
+                    f"Preprocessed input has {X_np.shape[1]} features but model expects {expected} features. Ensure the incoming JSON can be converted to the same expanded feature layout used during training."
+                )
         except Exception:
             # If model hparams can't be introspected, continue but the caller should ensure proper shape
             logging.debug("Could not validate feature vector against model.hparams; skipping strict check")
 
         return torch.from_numpy(X_np).float()
 
+
+def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
+    """Factory that creates and configures the Flask app with `/predict` route.
+
+    Loads the model once during app creation and reuses it for incoming requests.
+    """
+    app = Flask(__name__)
+
+    # load model using checkpoint's saved hparams
+    model = model_loader.load()
+
+    # Initialize Prometheus metrics (static imports at top of file)
+    metrics = PrometheusMetrics(app)
+
+    request_counter = Counter(
+        'api_requests_total', 'Total API requests', ['endpoint', 'method', 'status']
+    )
+    predict_counter = Counter('predict_requests_total', 'Total /predict requests', ['status'])
+
+    request_latency_histogram = Histogram(
+        'request_latency_seconds', 'Request latency histogram in seconds', ['endpoint', 'method', 'status']
+    )
+
+    @app.before_request
+    def before_request_timing():
+        # prevent recursion for metrics endpoint
+        if request.path == "/metrics":
+            return
+        g.request_start_time = perf_counter()
+
+    @app.after_request
+    def after_request_timing(response):
+        if request.path == "/metrics":
+            return response
+        start = getattr(g, 'request_start_time', None)
+        endpoint_label = request.endpoint or request.path
+        status_label = str(response.status_code)
+        elapsed = perf_counter() - start
+        request_latency_histogram.labels(endpoint=endpoint_label, method=request.method,
+                                         status=status_label).observe(elapsed)
+        request_counter.labels(endpoint=endpoint_label, method=request.method, status=status_label).inc()
+        return response
+
+    @app.route("/health", methods=["GET"])
+    @metrics.do_not_track()
+    def health():
+        logging.debug("Health endpoint pinged.")
+        return "OK", HTTPStatus.OK
+
     @app.route("/predict", methods=["POST"])
     def predict():
         try:
             payload = request.get_json(force=True)
-            x_tensor = prepare_input_from_json(payload)
+            x_tensor = preparer.prepare(payload, model=model)
             with torch.no_grad():
                 logits = model(x_tensor.float())
                 probs = nn.functional.softmax(logits, dim=1).cpu().numpy().tolist()
                 preds = np.argmax(probs, axis=1).tolist()
             out = [{"pred": int(p), "probs": pr} for p, pr in zip(preds, probs)]
+            # increment a predict-specific counter (if available)
+            predict_counter.labels(status='success').inc()
             return jsonify(out)
         except Exception as e:
             logging.error("Error during /predict: %s", e, exc_info=True)
+            predict_counter.labels(status='error').inc()
             return jsonify({"error": str(e)}), 400
 
     return app
 
 
-# add click decorators to serve and register commands into a group
 @click.command()
 @click.option("--host", default="0.0.0.0", help="Host to bind the Flask server")
 @click.argument("port", default=8000, required=False, type=int)
 def serve(host, port):
     """Start a Flask server exposing /predict"""
-    app = build_flask_app()
+    loader = ModelLoader()
+    preparer = InputPreparer()
+    app = create_app(loader, preparer)
     logging.info(f"Serving model {TrainingConfig.model_path} on http://{host}:{port}")
     app.run(host=host, port=int(port))
 
 
-# create a CLI group and register both commands so both 'infer' and 'serve' are available
-@click.group()
-def cli():
-    pass
+# create a CLI group and register both commands into a single entrypoint
+cli = click.Group()
 
-cli.add_command(infer)
 cli.add_command(serve)
+
 
 if __name__ == "__main__":
     cli()

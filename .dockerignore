@@ -1,0 +1,21 @@
+# Ignore common large and irrelevant files from build context
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+venv/
+.env.*
+.git
+.gitignore
+*.sqlite3
+*.db
+tmp/
+*.log
+.idea/
+.vscode/
+.Python
+.DS_Store
+

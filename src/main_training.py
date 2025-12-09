@@ -1,8 +1,6 @@
-import json
+import logging
 from pathlib import Path
 import click
-import logging
-from flask import Flask, request, jsonify
 
 import random
 import numpy as np
@@ -11,8 +9,7 @@ import polars as pl
 from typing import Tuple
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
-import pytorch_lightning as torchl
-from pytorch_lightning.callbacks import ModelCheckpoint
+import time
 from configs.configs import TrainingConfig
 from preprocessing.preprocess import preprocessing_pipeline_for_wisdm_raw_data
 import shutil
@@ -29,7 +26,6 @@ except Exception:
     logging.warning("TrainingConfig.seed not found, using default seed 44")
     seed_val = 44
 
-torchl.seed_everything(seed_val)
 torch.manual_seed(seed_val)
 np.random.seed(seed_val)
 random.seed(seed_val)
@@ -87,85 +83,53 @@ class SequenceDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-class LittleMLP(torchl.LightningModule):
+class LittleMLP(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, num_classes, lr):
         super().__init__()
-        self.save_hyperparameters()
-        self.lr = lr
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_classes = num_classes
-        self.net = None
+        # save hyperparams for later introspection
+        self.hparams = {
+            'input_size': int(input_size),
+            'hidden_size': int(hidden_size),
+            'num_layers': int(num_layers),
+            'num_classes': int(num_classes),
+            'lr': float(lr),
+        }
+        self.lr = float(lr)
+        self.input_size = int(input_size)
+        self.hidden_size = int(hidden_size)
+        self.num_layers = int(num_layers)
+        self.num_classes = int(num_classes)
+
         self.dropout = nn.Dropout(p=0.3)
-        self.criterion = nn.CrossEntropyLoss()
 
         layers = []
-        # ensure hyperparams are normal python ints (helps static checkers and downstream ops)
-        num_layers = int(self.num_layers)
-        hidden_size = int(self.hidden_size)
-        num_layers = max(1, num_layers)
-        # create `num_layers` hidden layers using hidden_size
-        in_dim = input_size
+        num_layers = max(1, self.num_layers)
+        in_dim = self.input_size
         for i in range(num_layers):
-            layers.append(nn.Linear(in_dim, hidden_size))
-            layers.append(nn.BatchNorm1d(hidden_size))
+            layers.append(nn.Linear(in_dim, self.hidden_size))
+            layers.append(nn.BatchNorm1d(self.hidden_size))
             layers.append(nn.ReLU(inplace=True))
             layers.append(self.dropout)
-            in_dim = hidden_size
-        # final classifier
+            in_dim = self.hidden_size
         layers.append(nn.Linear(in_dim, int(self.num_classes)))
         self.net = nn.Sequential(*layers)
-        # register the module so it's saved/loaded with checkpoints
-        self.add_module("net", self.net)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Accept either (batch, seq_len, input_size) or (batch, features)
         if x.dim() == 3:
             b, seq_len, feat = x.shape
             x = x.view(b, seq_len * feat)
         elif x.dim() == 1:
-            # single sample, make it a batch
             x = x.unsqueeze(0)
         elif x.dim() != 2:
             raise ValueError(f"Unexpected input tensor shape: {x.shape}")
+        return self.net(x.float())
 
-        input_dim = x.size(1)
-        if self.net is None:
-            self._build_mlp(input_dim)
-
-        logits = self.net(x.float())
-        return logits
-
-    def _label_to_indices(self, y: torch.Tensor) -> torch.Tensor:
-        # Accept one-hot, (N,1), or (N,) integer labels
+    @staticmethod
+    def _label_to_indices(y: torch.Tensor) -> torch.Tensor:
         if y.dim() > 1 and y.size(1) > 1:
             return y.argmax(dim=1).long()
         return y.view(-1).long()
-
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        logits = self(x.float())
-        y_idx = self._label_to_indices(y)
-        loss = self.criterion(logits, y_idx)
-        preds = torch.argmax(logits, dim=1)
-        acc = (preds == y_idx).float().mean()
-        self.log("train_loss", loss, prog_bar=True)
-        self.log("train_acc", acc, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        logits = self(x.float())
-        y_idx = self._label_to_indices(y)
-        loss = self.criterion(logits, y_idx)
-        preds = torch.argmax(logits, dim=1)
-        acc = (preds == y_idx).float().mean()
-        self.log("val_loss", loss, prog_bar=True)
-        self.log("val_acc", acc, prog_bar=True)
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 
 def make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1):
@@ -195,7 +159,7 @@ def cli():
 @click.option("--lr", default=TrainingConfig.lr, type=float)
 @click.option("--checkpoint", default=None, help="Optional path to resume checkpoint")
 def train(epochs, batch_size, lr, checkpoint):
-    """Train the model"""
+    """Train the model using plain PyTorch (no Lightning)."""
     data = preprocessing_pipeline_for_wisdm_raw_data()
 
     train_loader, val_loader, _ = make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1)
@@ -205,43 +169,87 @@ def train(epochs, batch_size, lr, checkpoint):
     model = LittleMLP(input_size=input_size, hidden_size=TrainingConfig.hidden_size,
                       num_layers=TrainingConfig.num_layers, num_classes=TrainingConfig.num_classes, lr=lr)
 
-    # ensure model dir exists
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # Prepare model dir
     model_dir_path = Path(TrainingConfig.model_dir)
     model_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Keep only the best checkpoint (save_top_k=1). We'll copy that best checkpoint to TrainingConfig.model_path
-    checkpoint_cb = ModelCheckpoint(dirpath=str(model_dir_path), filename="lstm", save_top_k=1, monitor="val_loss", mode="min")
-    trainer = torchl.Trainer(max_epochs=epochs, callbacks=[checkpoint_cb], logger=True, enable_checkpointing=True)
-    trainer.fit(model, train_loader, val_loader, ckpt_path=checkpoint)
+    best_val_loss = float('inf')
+    start_time = time.time()
 
-    # copy the best checkpoint (if available) to deterministic path from config
-    best_ckpt = checkpoint_cb.best_model_path
-    if best_ckpt:
+    # Optionally resume
+    if checkpoint:
         try:
-            dest = Path(TrainingConfig.model_path)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            best_path = Path(best_ckpt)
-            if best_path.resolve(strict=False) == dest.resolve(strict=False):
-                logging.info(f"Best checkpoint already at configured model_path: {dest}")
+            ckpt = torch.load(checkpoint, map_location=device)
+            if 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'])
             else:
-                shutil.copyfile(str(best_path), str(dest))
-                logging.info(f"Best checkpoint copied to configured model_path: {dest}")
+                model.load_state_dict(ckpt)
+            logging.info(f"Resumed model weights from checkpoint: {checkpoint}")
         except Exception as e:
-            logging.error("Failed to copy best checkpoint to configured model_path: %s", e, exc_info=True)
-            # fallback: still try to save trainer checkpoint to configured path
-            try:
-                trainer.save_checkpoint(str(TrainingConfig.model_path))
-                logging.info(f"Fallback checkpoint saved at: {TrainingConfig.model_path}")
-            except Exception as e2:
-                logging.error("Fallback save also failed: %s", e2, exc_info=True)
-    else:
-        # No best model found (maybe training didn't run any validation); save last checkpoint to configured path
-        try:
-            trainer.save_checkpoint(str(TrainingConfig.model_path))
-            logging.info(f"Checkpoint saved at: {TrainingConfig.model_path}")
-        except Exception as e:
-            logging.error("Failed to save checkpoint to configured model_path: %s", e, exc_info=True)
+            logging.warning(f"Failed to load checkpoint {checkpoint}: {e}")
 
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_losses = []
+        train_accs = []
+
+        for x_batch, y_batch in train_loader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            optimizer.zero_grad()
+            logits = model(x_batch)
+            y_idx = LittleMLP._label_to_indices(y_batch)
+            loss = criterion(logits, y_idx)
+            loss.backward()
+            optimizer.step()
+
+            preds = torch.argmax(logits, dim=1)
+            acc = (preds == y_idx).float().mean().item()
+            train_losses.append(loss.item())
+            train_accs.append(acc)
+
+        # validation
+        model.eval()
+        val_losses = []
+        val_accs = []
+        with torch.no_grad():
+            for x_batch, y_batch in val_loader:
+                x_batch = x_batch.to(device)
+                y_batch = y_batch.to(device)
+                logits = model(x_batch)
+                y_idx = LittleMLP._label_to_indices(y_batch)
+                loss = criterion(logits, y_idx)
+                preds = torch.argmax(logits, dim=1)
+                acc = (preds == y_idx).float().mean().item()
+                val_losses.append(loss.item())
+                val_accs.append(acc)
+
+        train_loss = float(np.mean(train_losses)) if train_losses else 0.0
+        train_acc = float(np.mean(train_accs)) if train_accs else 0.0
+        val_loss = float(np.mean(val_losses)) if val_losses else float('inf')
+        val_acc = float(np.mean(val_accs)) if val_accs else 0.0
+
+        logging.info(f"Epoch {epoch}/{epochs}  train_loss={train_loss:.4f} train_acc={train_acc:.4f}  val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            try:
+                dest = Path(TrainingConfig.model_path)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({'model_state_dict': model.state_dict(), 'hparams': model.hparams}, str(dest))
+                logging.info(f"Saved new best model to: {dest}")
+            except Exception as e:
+                logging.error("Failed to save best model: %s", e, exc_info=True)
+
+    total_time = time.time() - start_time
+    logging.info(f"Training finished in {total_time:.1f}s. Best val_loss={best_val_loss:.4f}")
 
 
 if __name__ == "__main__":
