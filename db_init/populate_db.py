@@ -95,7 +95,7 @@ def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) 
     lf_all = []
     for p in paths:
         # scan_csv with eol_char=';' because lines end with ';' in raw files
-        lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char=';')
+        lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char='\n')
         # derive sensor/device/subject from filename; we'll keep subject_id column from file
         _, sensor, device = str(p).removesuffix('.txt').split('_')[-3:]
         lf = (
@@ -103,6 +103,7 @@ def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) 
             .with_columns(
                 pl.lit(sensor).alias('sensor'),
                 pl.lit(device).alias('device'),
+                pl.col('subject_id').str.replace_all(r'^\n', '').alias('subject_id')
             )
         )
         lf_all.append(lf)

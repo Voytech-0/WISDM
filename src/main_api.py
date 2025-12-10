@@ -11,9 +11,15 @@ import torch
 from flask import request, jsonify, Flask, g
 from torch import nn
 import polars as pl
+
+from configs.configs import TrainingConfig
 from main_training import LittleMLP
 import threading
 import os
+
+from preprocessing.preprocess import expand_raw_items_to_expanded_df
+from prometheus_flask_exporter import PrometheusMetrics
+from prometheus_client import Counter, Histogram
 
 
 class ModelLoader:
@@ -45,10 +51,12 @@ class ModelLoader:
         model.eval()
         return model
 
-    def validate(self) -> None:
+    def validate(self):
         if not self.checkpoint_path.exists():
             logging.error("Checkpoint not found: %s", self.checkpoint_path)
-            raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
+            # raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
+            return False
+        return True
 
     def _get_checkpoint_mtime(self) -> Optional[float]:
         try:

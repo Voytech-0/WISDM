@@ -3,7 +3,7 @@ cryptography==40.0.2
 Flask==2.2.5
 opentelemetry-api==1.28.2
 pandas==2.2.2
-polars==0.18.15
+polars==1.36.0
 pyarrow==12.0.1
 PyMySQL==1.0.3
 python-dotenv==1.0.0

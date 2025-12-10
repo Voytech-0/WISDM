@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 from typing import List, Dict, Any, Optional
 
+import numpy as np
 import polars as pl
 from sqlalchemy import create_engine, text
 import time
@@ -68,11 +69,32 @@ def load_data_raw_with_row_per_sensor_device_activity_subject() -> pl.LazyFrame:
         rows = result.fetchall()
         cols = result.keys()
 
-    if not rows:
-        logging.error("Query returned no rows from database query: %s", query)
-        raise RuntimeError("Query returned no rows")
-
-    df = pl.DataFrame(rows, schema=list(cols))
+    try:
+        rows_tuples = [tuple(r) for r in rows]  # force plain tuples
+        df = pl.DataFrame(rows_tuples, schema=list(cols), orient="row")
+    except Exception as exc:
+        logging.debug("rows type: %s, length=%d", type(rows), len(rows))
+        for i, r in enumerate(rows[:10]):
+            logging.debug("row %d type=%s", i, type(r))
+            tup = tuple(r)  # safe conversion
+            logging.debug("  as tuple len=%d", len(tup))
+            for j, v in enumerate(tup):
+                logging.debug("    col=%d type=%s repr=%r", j, type(v), repr(v)[:200])
+        logging.exception(f"Failed to construct DataFrame from database rows. for data shape {np.array(rows).shape} cols=%s rows_sample=%s", list(cols), rows[:10])
+        print(f"DataFrame construction failed. cols shape {len(list(cols))} cols:", list(cols))
+        # finding faulty data raw
+        for i, row in enumerate(rows):
+            try:
+                pl.DataFrame([row], schema=list(cols))
+            except Exception as row_exc:
+                logging.error("Row %d caused DataFrame construction failure: %s", i, row)
+            break
+        raise
+    # drop prefix '/n' from subject_id if present
+    # should not be necessary if data ingestion is correct, but added because of prior error
+    df = df.with_columns([
+        pl.col('subject_id').str.replace_all(r'^\n', '').alias('subject_id')
+    ])
 
     # Ensure numeric types for timestamp,x,y,z and drop incomplete rows
     df = df.with_columns([
@@ -297,10 +319,7 @@ def expand_lists(df: pl.DataFrame, list_cols: List[str]) -> pl.DataFrame:
 def preprocessing_pipeline_for_wisdm_raw_data():
 
      lf = load_data_raw_with_row_per_sensor_device_activity_subject()
-     # print(data.collect())
-     # print(lf.collect())
      lf = convert_data_to_10_seconds_intervals(lf)
-     # print(lf.collect())
      lf = apply_z_score_normalization(lf, train=True)
      # lf = one_hot_encode(lf, ["device", "sensor", "label"])
      # DataFrame from LazyFrame
@@ -374,7 +393,7 @@ def expand_raw_items_to_expanded_df(items: List[Dict[str, Any]]) -> pl.DataFrame
     Returns a Polars DataFrame with expanded scalar feature columns (x_0.., y_0.., z_0..)
     """
     lf = build_raw_lazyframe_from_items(items)
-    ls = lazyframe_to_single_10s(lf)
+    lf = lazyframe_to_single_10s(lf)
     lf_norm = apply_z_score_normalization(lf, train=False, group_columns=['device', 'sensor'])
     df_norm = collect_and_dummify_drop_subject(lf_norm)
     df_expanded = expand_lists(df_norm, ['x', 'y', 'z'])
