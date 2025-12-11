@@ -217,6 +217,7 @@ def train(epochs, batch_size, lr, checkpoint):
         model.eval()
         val_losses = []
         val_accs = []
+        all_preds = []
         with torch.no_grad():
             for x_batch, y_batch in val_loader:
                 y_batch = y_batch.to(device)
@@ -227,13 +228,19 @@ def train(epochs, batch_size, lr, checkpoint):
                 acc = (preds == y_idx).float().mean().item()
                 val_losses.append(loss.item())
                 val_accs.append(acc)
+                all_preds.append(preds.cpu().numpy())
+
 
         train_loss = float(np.mean(train_losses)) if train_losses else 0.0
         train_acc = float(np.mean(train_accs)) if train_accs else 0.0
         val_loss = float(np.mean(val_losses)) if val_losses else float('inf')
         val_acc = float(np.mean(val_accs)) if val_accs else 0.0
+        preds_dict = {}
+        for batch_preds in all_preds:
+            for p in batch_preds:
+                preds_dict[int(p)] = preds_dict.get(p, 0) + 1
 
-        logging.info(f"Epoch {epoch}/{epochs}  train_loss={train_loss:.4f} train_acc={train_acc:.4f}  val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+        logging.info(f"Epoch {epoch}/{epochs}  train_loss={train_loss:.4f} train_acc={train_acc:.4f}  val_loss={val_loss:.4f} val_acc={val_acc:.4f} Predictions={preds_dict}")
 
         # Save best model
         if val_loss < best_val_loss:

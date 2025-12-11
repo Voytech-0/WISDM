@@ -50,6 +50,33 @@ def wait_for_mysql(engine, timeout: int = 30, interval: float = 1.0):
             logging.warning("MySQL not ready (attempt=%d), sleeping %.1fs: %s", attempt, sleep_for, exc)
             time.sleep(sleep_for)
 
+def load_raw_data_from_local():
+    prefix_path = DataConfig.data_path_prefix
+    file_header = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
+
+    paths = list(Path(prefix_path).rglob("data_*.txt"))
+    logging.info("Found %d local data files under %s", len(paths), prefix_path)
+
+    if not paths:
+        return None
+
+    lf_all = []
+    for p in paths:
+        lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char=";")
+        subject_id, sensor, device = str(p).removesuffix(".txt").split('_')[-3:]
+        lf = (
+            lf
+            .with_columns(
+                (pl.lit(sensor).alias("sensor")),
+                (pl.lit(device).alias("device")),
+            )
+        )
+        lf_all.append(lf)
+
+    lf_all = pl.concat(lf_all).drop_nulls()
+
+    return lf_all
+
 def load_raw_data_from_mysql() -> pl.LazyFrame:
 
     logging.info("user %s connecting to %s:%s database %s", MySQLConfig.user, MySQLConfig.host, MySQLConfig.port,
@@ -319,16 +346,18 @@ def expand_lists(df: pl.DataFrame, list_cols: List[str]) -> pl.DataFrame:
 
 
 def preprocessing_pipeline_for_wisdm_raw_data():
-     lf = load_raw_data_from_mysql()
-     lf = raw_data_into_xyz_series(lf)
-     lf = convert_data_to_10_seconds_intervals(lf)
-     lf = apply_z_score_normalization(lf, train=True)
-     # lf = one_hot_encode(lf, ["device", "sensor", "label"])
-     # DataFrame from LazyFrame
-     df = collect_and_dummify_drop_subject(lf)
-     df = expand_lists(df, ["x", "y", "z"])
-     logging.info("Preprocessing produced DataFrame with %d rows and %d columns", df.height, len(df.columns))
-     return df
+    lf = load_raw_data_from_local()
+    if lf is None:
+        lf = load_raw_data_from_mysql()
+    lf = raw_data_into_xyz_series(lf)
+    lf = convert_data_to_10_seconds_intervals(lf)
+    lf = apply_z_score_normalization(lf, train=True)
+    # lf = one_hot_encode(lf, ["device", "sensor", "label"])
+    # DataFrame from LazyFrame
+    df = collect_and_dummify_drop_subject(lf)
+    df = expand_lists(df, ["x", "y", "z"])
+    logging.info("Preprocessing produced DataFrame with %d rows and %d columns", df.height, len(df.columns))
+    return df
 
 
 def build_raw_lazyframe_from_items(items: List[Dict[str, Any]]) -> pl.LazyFrame:
