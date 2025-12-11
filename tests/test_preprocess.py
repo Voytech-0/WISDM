@@ -5,11 +5,11 @@ import pandas as pd
 import polars as pl
 import pytest
 from preprocessing.preprocess import (
-  load_data_raw_with_row_per_sensor_device_activity_subject,
-  convert_data_to_10_seconds_intervals,
-  apply_z_score_normalization,
-  _source_target_split,
-  preprocessing_pipeline_for_wisdm_raw_data
+    raw_data_into_xyz_series,
+    convert_data_to_10_seconds_intervals,
+    apply_z_score_normalization,
+    _source_target_split,
+    preprocessing_pipeline_for_wisdm_raw_data
 )
 
 
@@ -33,7 +33,7 @@ def test_load_data_raw_with_row_per_sensor_device_activity_subject(tmp_path):
         "2,Jogging,201,1.3,1.4,1.5;\n"
     )
 
-    lf = load_data_raw_with_row_per_sensor_device_activity_subject(str(tmp_path))
+    lf = raw_data_into_xyz_series(str(tmp_path))
     assert lf is not None
 
     df = lf.collect()

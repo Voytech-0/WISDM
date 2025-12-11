@@ -50,13 +50,10 @@ def wait_for_mysql(engine, timeout: int = 30, interval: float = 1.0):
             logging.warning("MySQL not ready (attempt=%d), sleeping %.1fs: %s", attempt, sleep_for, exc)
             time.sleep(sleep_for)
 
+def load_raw_data_from_mysql() -> pl.LazyFrame:
 
-def load_data_raw_with_row_per_sensor_device_activity_subject() -> pl.LazyFrame:
-    """
-    Returns a polars LazyFrame where each row corresponds to one (subject_id, device, sensor, label)
-    and the columns x,y,z are lists of values ordered by timestamp.
-    """
-    logging.info("user %s connecting to %s:%s database %s", MySQLConfig.user, MySQLConfig.host, MySQLConfig.port, MySQLConfig.db)
+    logging.info("user %s connecting to %s:%s database %s", MySQLConfig.user, MySQLConfig.host, MySQLConfig.port,
+                 MySQLConfig.db)
     engine = create_engine(
         f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
     )
@@ -64,40 +61,46 @@ def load_data_raw_with_row_per_sensor_device_activity_subject() -> pl.LazyFrame:
     wait_for_mysql(engine, timeout=DataConfig.db_connect_timeout if hasattr(DataConfig, 'db_connect_timeout') else 30)
     query = "SELECT subject_id, label, timestamp, x, y, z, sensor, device FROM wisdm_raw"
 
-    with engine.connect() as conn:
-        result = conn.execute(text(query))
-        rows = result.fetchall()
-        cols = result.keys()
+    chunk_size = int(getattr(DataConfig, 'db_read_chunk_size', 10000))
 
-    try:
-        rows_tuples = [tuple(r) for r in rows]  # force plain tuples
-        df = pl.DataFrame(rows_tuples, schema=list(cols), orient="row")
-    except Exception as exc:
-        logging.debug("rows type: %s, length=%d", type(rows), len(rows))
-        for i, r in enumerate(rows[:10]):
-            logging.debug("row %d type=%s", i, type(r))
-            tup = tuple(r)  # safe conversion
-            logging.debug("  as tuple len=%d", len(tup))
-            for j, v in enumerate(tup):
-                logging.debug("    col=%d type=%s repr=%r", j, type(v), repr(v)[:200])
-        logging.exception(f"Failed to construct DataFrame from database rows. for data shape {np.array(rows).shape} cols=%s rows_sample=%s", list(cols), rows[:10])
-        print(f"DataFrame construction failed. cols shape {len(list(cols))} cols:", list(cols))
-        # finding faulty data raw
-        for i, row in enumerate(rows):
-            try:
-                pl.DataFrame([row], schema=list(cols))
-            except Exception as row_exc:
-                logging.error("Row %d caused DataFrame construction failure: %s", i, row)
-            break
-        raise
-    # drop prefix '/n' from subject_id if present
+    frames = []
+    cols = None
+
+    with engine.connect() as conn:
+        result = conn.execution_options(stream_results=True).execute(text(query))
+        cols = list(result.keys())
+        while True:
+            batch = result.fetchmany(size=chunk_size)
+            if not batch:
+                break
+            rows = [tuple(r) for r in batch]
+            df_chunk = pl.DataFrame(rows, schema=cols, orient="row")
+            frames.append(df_chunk)
+
+    if not frames:
+        logging.error("No data found in wisdm_raw table.")
+        df = pl.DataFrame([], schema=cols if cols is not None else [])
+        return df.lazy()
+
+    # Concatenate all chunk DataFrames
+    df = pl.concat(frames, how='vertical')
+
+    # drop prefix '\n' from subject_id if present
     # should not be necessary if data ingestion is correct, but added because of prior error
     df = df.with_columns([
         pl.col('subject_id').str.replace_all(r'^\n', '').alias('subject_id')
     ])
+    logging.info("Loaded raw data from MySQL: %d rows, %d columns", df.height, len(df.columns))
+    return df.lazy()
+
+def raw_data_into_xyz_series(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Returns a polars LazyFrame where each row corresponds to one (subject_id, device, sensor, label)
+    and the columns x,y,z are lists of values ordered by timestamp.
+    """
 
     # Ensure numeric types for timestamp,x,y,z and drop incomplete rows
-    df = df.with_columns([
+    lf = lf.with_columns([
         pl.col('timestamp').cast(pl.Float64).alias('timestamp'),
         pl.col('x').cast(pl.Float64).alias('x'),
         pl.col('y').cast(pl.Float64).alias('y'),
@@ -105,11 +108,11 @@ def load_data_raw_with_row_per_sensor_device_activity_subject() -> pl.LazyFrame:
     ]).filter(pl.col('z').is_not_null())
 
     # sort by timestamp to preserve ordering within groups
-    df = df.sort(['subject_id', 'device', 'sensor', 'label', 'timestamp'])
+    lf = lf.sort(['subject_id', 'device', 'sensor', 'label', 'timestamp'])
 
     # group and aggregate x,y,z into lists (maintain order)
     grouped = (
-        df
+        lf
         .group_by(['subject_id', 'device', 'sensor', 'label'], maintain_order=True)
         .agg([
             pl.col('x').alias('x'),
@@ -118,7 +121,7 @@ def load_data_raw_with_row_per_sensor_device_activity_subject() -> pl.LazyFrame:
         ])
     )
 
-    return grouped.lazy()
+    return grouped
 
 
 
@@ -315,8 +318,8 @@ def expand_lists(df: pl.DataFrame, list_cols: List[str]) -> pl.DataFrame:
 
 
 def preprocessing_pipeline_for_wisdm_raw_data():
-
-     lf = load_data_raw_with_row_per_sensor_device_activity_subject()
+     lf = load_raw_data_from_mysql()
+     lf = raw_data_into_xyz_series(lf)
      lf = convert_data_to_10_seconds_intervals(lf)
      lf = apply_z_score_normalization(lf, train=True)
      # lf = one_hot_encode(lf, ["device", "sensor", "label"])

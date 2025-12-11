@@ -41,6 +41,7 @@ class ModelConfig:
 
 @dataclass(init=False, frozen=True)
 class DataConfig:
+    db_read_chunk_size: int = 10000
     frequency: int = 20
     feature_length_in_seconds: int = 10
     data_path_prefix: str = "data/wisdm-dataset/raw"

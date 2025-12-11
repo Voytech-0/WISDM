@@ -231,6 +231,20 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
         logging.debug("Health endpoint pinged.")
         return "OK", HTTPStatus.OK
 
+    @app.route("/reload", methods=["POST"])
+    def reload_model():
+        """Reload the cached model from disk and replace the in-memory model used by handlers."""
+        nonlocal model  # assign to outer-scope model variable
+        try:
+            new_model = model_loader.load(force_reload=True)
+            model = new_model
+            logging.info("Model reloaded from checkpoint: %s",
+                         getattr(model_loader.checkpoint_path, "name", str(model_loader.checkpoint_path)))
+            return jsonify({"status": "reloaded"}), HTTPStatus.OK
+        except Exception as e:
+            logging.exception("Failed to reload model")
+            return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+
     @app.route("/predict", methods=["POST"])
     def predict():
         try:

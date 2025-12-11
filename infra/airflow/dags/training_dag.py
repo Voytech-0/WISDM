@@ -46,4 +46,13 @@ model_training_task = DockerOperator(
     dag=dag,
 )
 
-perhaps_populate_task >> model_training_task
+restart_app_task = BashOperator(
+    bash_command=(
+        "docker compose -f infra/docker-compose.yaml restart app "
+        "|| docker-compose -f infra/docker-compose.yaml restart app"
+    ),
+    task_id="restart_app",
+    dag=dag,
+)
+
+perhaps_populate_task >> model_training_task >> restart_app_task
