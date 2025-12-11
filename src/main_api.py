@@ -157,6 +157,7 @@ class InputPreparer:
         all_cols = list(df_expanded.columns)
         label_cols = [c for c in all_cols if c.startswith('label')]
         feature_cols = [c for c in all_cols if c not in label_cols]
+        logging.info("Prepared input with %d items, %d features", df_expanded.height, len(feature_cols))
         if not feature_cols:
             logging.error("No feature columns found after preprocessing")
             raise ValueError("No feature columns found after preprocessing")
@@ -170,8 +171,6 @@ class InputPreparer:
                 # model.hparams may be an argparse Namespace-like or dict-like object
                 if hasattr(model.hparams, 'input_size'):
                     expected = int(model.hparams.input_size)
-                elif 'input_size' in dict(model.hparams):
-                    expected = int(dict(model.hparams)['input_size'])
             if expected is not None and X_np.shape[1] != expected:
                 raise ValueError(
                     f"Preprocessed input has {X_np.shape[1]} features but model expects {expected} features. Ensure the incoming JSON can be converted to the same expanded feature layout used during training."

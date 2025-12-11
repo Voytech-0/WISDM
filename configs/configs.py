@@ -28,7 +28,7 @@ def _resolve_mysql_host():
 
 @dataclass(init=False, frozen=True)
 class PathsConfig:
-    z_score_params_path: str = "./data/processed/z_score_params/.csv"
+    z_score_params_path: str = str(project_root / 'models' / 'processed' / 'z_score_params.csv')
 
 @dataclass(init=False, frozen=True)
 class GeneralConfig:
@@ -41,10 +41,13 @@ class ModelConfig:
 
 @dataclass(init=False, frozen=True)
 class DataConfig:
-    db_read_chunk_size: int = 10000
+    db_read_chunk_size: int = 100000
     frequency: int = 20
     feature_length_in_seconds: int = 10
     data_path_prefix: str = "data/wisdm-dataset/raw"
+    possible_devices: list[str] = ("phone", "watch")
+    possible_sensors: list[str] = ("accel", "gyro")
+    possible_labels: list[str] = ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S")
     train_split: float = 0.8
     validation_split: float = 0.1
     test_split: float = 0.1

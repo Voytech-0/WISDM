@@ -76,6 +76,7 @@ def load_raw_data_from_mysql() -> pl.LazyFrame:
             rows = [tuple(r) for r in batch]
             df_chunk = pl.DataFrame(rows, schema=cols, orient="row")
             frames.append(df_chunk)
+    logging.info("Finished reading data from MySQL in %d chunks of up to %d rows", len(frames), chunk_size)
 
     if not frames:
         logging.error("No data found in wisdm_raw table.")
@@ -337,8 +338,8 @@ def build_raw_lazyframe_from_items(items: List[Dict[str, Any]]) -> pl.LazyFrame:
     """
     rows = []
     for it in items:
-        device = it.get('device') or 'unknown'
-        sensor = it.get('sensor') or 'unknown'
+        device = it.get('device') or None
+        sensor = it.get('sensor') or None
         subject_id = it.get('subject_id') or 'unknown'
         label = it.get('label') if 'label' in it else None
         # coerce numeric values - allow callers to raise if conversion fails
@@ -364,27 +365,50 @@ def lazyframe_to_single_10s(lf: pl.LazyFrame) -> pl.LazyFrame:
     if not required.issubset(names):
         raise AssertionError(f"LazyFrame must contain columns {required}, got {names}")
 
-    # Use list.to_array(max_len) which truncates longer lists and pads shorter lists with nulls.
-    # Cast back to List to preserve list-typed columns.
+    # Pad/truncate lists to the desired length. We use concat_list + slice so we can
+    # pad with zeros (matching test expectations) and avoid `.list.to_array` width errors.
+    pad_x = [0] * desired_length
+    pad_y = [0.0] * desired_length
+    pad_z = [0.0] * desired_length
+
     lf_fixed = lf.with_columns([
-        pl.col('x').list.to_array(desired_length).alias('x'),
-        pl.col('y').list.to_array(desired_length).alias('y'),
-        pl.col('z').list.to_array(desired_length).alias('z'),
+        pl.concat_list([pl.col('x'), pl.lit(pad_x)]).list.slice(0, desired_length).alias('x'),
+        pl.concat_list([pl.col('y'), pl.lit(pad_y)]).list.slice(0, desired_length).alias('y'),
+        pl.concat_list([pl.col('z'), pl.lit(pad_z)]).list.slice(0, desired_length).alias('z'),
     ])
 
     return lf_fixed
 
 
-
-
 def collect_and_dummify_drop_subject(lf: pl.LazyFrame) -> pl.DataFrame:
-    """Collect lazyframe to DataFrame, dummify device/sensor/label if present, and drop subject_id to match training pipeline."""
+    """
+    Collect lazyframe, dummify device/sensor/label efficiently, ensure
+    all specified dummy columns exist, and drop subject_id/original columns.
+    """
     df = lf.collect()
-    dummy_cols = [c for c in ['device', 'sensor', 'label'] if c in df.columns]
-    if dummy_cols:
-        df = df.to_dummies(columns=dummy_cols)
+    columns_to_dummify = ['device', 'sensor', 'label']
+
+    present_cols = [col for col in columns_to_dummify if col in df.columns]
+
+    if present_cols:
+        df = df.to_dummies(present_cols)
+    new_cols_expressions = []
+
+    for col in columns_to_dummify:
+        possible_values: List[str] = getattr(DataConfig, f'possible_{col}s', [])
+
+        for val in possible_values:
+            colname = f"{col}_{str(val)}"
+
+            if colname not in df.columns:
+                new_cols_expressions.append(pl.lit(0).alias(colname))
+
+    if new_cols_expressions:
+        df = df.with_columns(new_cols_expressions)
+
     if 'subject_id' in df.columns:
         df = df.drop('subject_id')
+
     return df
 
 

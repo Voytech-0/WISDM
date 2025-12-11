@@ -4,12 +4,19 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import pytest
+from sqlalchemy.util import monkeypatch_proxied_specials
+
+import preprocessing.preprocess as preprocess
+from configs.configs import DataConfig
 from preprocessing.preprocess import (
     raw_data_into_xyz_series,
     convert_data_to_10_seconds_intervals,
     apply_z_score_normalization,
     _source_target_split,
-    preprocessing_pipeline_for_wisdm_raw_data
+    preprocessing_pipeline_for_wisdm_raw_data,
+    build_raw_lazyframe_from_items,
+    lazyframe_to_single_10s,
+    collect_and_dummify_drop_subject
 )
 
 
@@ -74,7 +81,6 @@ def test_convert_data_to_10_seconds_intervals(monkeypatch):
 
     monkeypatch.setattr(preprocess.DataConfig, "feature_length_in_seconds", 10)
     monkeypatch.setattr(preprocess.DataConfig, "frequency", 1)
-    case_1_length = 20
     cases = [
         {
             "data": pl.LazyFrame(
@@ -83,9 +89,9 @@ def test_convert_data_to_10_seconds_intervals(monkeypatch):
                     "device": ["phone"],
                     "sensor": ["accel"],
                     "label": ["A"],
-                    "x": [[float(i) for i in range(case_1_length)]],
-                    "y": [[float(i + 0.1) for i in range(case_1_length)]],
-                    "z": [[float(i + 0.2) for i in range(case_1_length)]],
+                    "x": [[float(i) for i in range(20)]],
+                    "y": [[float(i + 0.1) for i in range(20)]],
+                    "z": [[float(i + 0.2) for i in range(20)]],
                 }
             ),
             "expected": pl.LazyFrame(
@@ -173,4 +179,170 @@ def test_source_target_split():
             case["expected_labels"].collect().to_pandas(),
             check_like=True
         )
-        
+
+def test_build_raw_lazyframe_from_items():
+    cases = [
+        {
+            "data": [
+                {"x": [1.0, 2.0], "y": [3.0, 4.0], "z": [5.0, 6.0], "label": "A"},
+                {"x": [7.0, 8.0], "y": [9.0, 10.0], "z": [11.0, 12.0], "label": "B"},
+            ],
+            "expected": pl.LazyFrame(
+                {
+                    "x": [[1.0, 2.0], [7.0, 8.0]],
+                    "y": [[3.0, 4.0], [9.0, 10.0]],
+                    "z": [[5.0, 6.0], [11.0, 12.0]],
+                    "label": ["A", "B"],
+                    "subject_id": ["unknown", "unknown"],
+                    "device": [None, None],
+                    "sensor": [None, None],
+                }
+            )
+        },
+        {
+            "data": [
+                {"x": [0.0, 1.0], "y": [1.0, 2.0], "z": [2.0, 3.0]},
+            ],
+            "expected": pl.LazyFrame(
+                {
+                    "x": [[0.0, 1.0]],
+                    "y": [[1.0, 2.0]],
+                    "z": [[2.0, 3.0]],
+                    "label": [None],
+                    "subject_id": ["unknown"],
+                    "device": [None],
+                    "sensor": [None],
+                }
+            )
+        }
+    ]
+    for case in cases:
+        out = build_raw_lazyframe_from_items(case["data"])
+        pd.testing.assert_frame_equal(
+            out.collect().to_pandas(),
+            case["expected"].collect().to_pandas(),
+            check_like=True
+        )
+
+def test_lazyframe_to_single_10s(monkeypatch):
+    cases = [
+        {
+            "data": pl.LazyFrame(
+            {
+                "subject_id": ["1"],
+                "device": ["phone"],
+                "sensor": ["accel"],
+                "label": ["A"],
+                "x": [[float(i) for i in range(20)]],
+                "y": [[float(i + 0.1) for i in range(20)]],
+                "z": [[float(i + 0.2) for i in range(20)]],
+            }
+            ),
+            "expected": pl.LazyFrame(
+                {
+                    "subject_id": ["1"],
+                    "device": ["phone"],
+                    "sensor": ["accel"],
+                    "label": ["A"],
+                    "x": [[float(i) for i in range(10)]],
+                    "y": [[float(i + 0.1) for i in range(10)]],
+                    "z": [[float(i + 0.2) for i in range(10)]],
+                }
+            )
+        },
+        {
+            "data": pl.LazyFrame(
+                {
+                    "subject_id": ["2"],
+                    "device": ["watch"],
+                    "sensor": ["gyro"],
+                    "label": ["B"],
+                    "x": [[float(i) for i in range(5)]],
+                    "y": [[float(i + 0.1) for i in range(5)]],
+                    "z": [[float(i + 0.2) for i in range(5)]],
+                }
+            ),
+            "expected": pl.LazyFrame(
+                {
+                    "subject_id": ["2"],
+                    "device": ["watch"],
+                    "sensor": ["gyro"],
+                    "label": ["B"],
+                    "x": [[0, 1, 2, 3, 4, 0, 0, 0, 0, 0]],
+                    "y": [[0.1, 1.1, 2.1, 3.1, 4.1, 0.0, 0.0, 0.0, 0.0, 0.0]],
+                    "z": [[0.2, 1.2, 2.2, 3.2, 4.2, 0.0, 0.0, 0.0, 0.0, 0.0]],
+                }
+            )
+        }
+    ]
+
+    # patch the DataConfig object used in the preprocessing module
+    monkeypatch.setattr(preprocess.DataConfig, "feature_length_in_seconds", 10)
+    monkeypatch.setattr(preprocess.DataConfig, "frequency", 1)
+
+    for case in cases:
+        out = lazyframe_to_single_10s(case["data"])
+        print("OUT done", flush=True)
+        df = out.collect()
+        print("DF done", flush=True)
+        pd.testing.assert_frame_equal(
+            df.to_pandas(),
+            case["expected"].collect().to_pandas(),
+            check_like=True
+        )
+
+
+def test_collect_and_dummify_drop_subject(monkeypatch):
+    cases = [
+        {
+            "data": pl.LazyFrame(
+                {
+                    "subject_id": ["1", "2"],
+                    "device": ["phone", "watch"],
+                    "sensor": ["accel", "gyro"],
+                    "label": ["A", "A"],
+                    "x": [[1.0, 2.0], [3.0, 4.0]],
+                    "y": [[2.0, 3.0], [4.0, 5.0]],
+                    "z": [[3.0, 4.0], [5.0, 6.0]],
+                }
+            ),
+            "expected_columns": {"device_phone", "device_watch", "sensor_accel", "sensor_gyro", "label_A", "label_B", "x", "y", "z"},
+            "expected_height": 2,
+            "expected_dummies_with_1": [[1, 0, 1, 0, 1, 0], [0, 1, 0, 1, 1, 0]]
+        },
+        {
+            "data": pl.LazyFrame(
+                {
+                    "subject_id": ["3"],
+                    "device": ["phone"],
+                    "sensor": ["accel"],
+                    "label": ["B"],
+                    "x": [[5.0, 6.0]],
+                    "y": [[6.0, 7.0]],
+                    "z": [[7.0, 8.0]],
+                }
+            ),
+            "expected_columns": {"device_phone", "device_watch", "sensor_accel", "sensor_gyro", "label_A", "label_B", "x", "y", "z"},
+            "expected_height": 1,
+            "expected_dummies_with_1": [[1, 0, 1, 0, 0, 1]]
+        }
+    ]
+    monkeypatch.setattr(preprocess.DataConfig, "possible_devices", ["phone", "watch"])
+    monkeypatch.setattr(preprocess.DataConfig, "possible_sensors", ["accel", "gyro"])
+    monkeypatch.setattr(preprocess.DataConfig, "possible_labels", ["A", "B"])
+
+    for case in cases:
+        df = collect_and_dummify_drop_subject(case["data"])
+        assert set(df.columns) == set(case["expected_columns"])
+        assert df.height == case["expected_height"]
+        assert "subject_id" not in df.columns
+        for i, row in enumerate(df.to_dicts()):
+            dummies = [
+                row["device_phone"],
+                row["device_watch"],
+                row["sensor_accel"],
+                row["sensor_gyro"],
+                row["label_A"],
+                row["label_B"],
+            ]
+            assert dummies == case["expected_dummies_with_1"][i]

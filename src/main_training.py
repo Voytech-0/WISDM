@@ -219,7 +219,6 @@ def train(epochs, batch_size, lr, checkpoint):
         val_accs = []
         with torch.no_grad():
             for x_batch, y_batch in val_loader:
-                x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
                 logits = model(x_batch)
                 y_idx = LittleMLP._label_to_indices(y_batch)
