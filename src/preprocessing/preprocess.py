@@ -158,9 +158,7 @@ def get_z_score_stats() -> pl.LazyFrame:
     if Path(file_path).exists():
         with open(file_path, 'rb') as f:
             stats_df = pickle.load(f)
-        if isinstance(stats_df, pl.DataFrame):
-            return stats_df
-        return pl.DataFrame(stats_df)
+        return pl.LazyFrame(stats_df)
     else:
         logging.error("Z-score stats file not found at %s", file_path)
         raise FileNotFoundError(f"Z-score stats file not found at {file_path}")

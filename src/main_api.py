@@ -15,7 +15,6 @@ import polars as pl
 from configs.configs import TrainingConfig
 from main_training import LittleMLP
 import threading
-import os
 
 from preprocessing.preprocess import expand_raw_items_to_expanded_df
 from prometheus_flask_exporter import PrometheusMetrics
@@ -43,11 +42,39 @@ class ModelLoader:
     def _load_cached(checkpoint_path_str: str, mtime: Optional[float], model_cls):
         """Class-scoped cached loader.
 
-        Decorated with @cache so the cache sits directly on the method definition.
-        Cache key includes checkpoint path and mtime; when mtime changes a fresh
-        model will be loaded. Call `_load_cached.cache_clear()` to force reload.
+        This loader strictly expects the checkpoint format produced by `main_training.py`:
+        {
+            'model_state_dict': <state_dict>,
+            'hparams': { 'input_size': ..., 'hidden_size': ..., 'num_layers': ..., 'num_classes': ..., 'lr': ... }
+        }
+
+        It will raise a RuntimeError with a helpful message if the file is missing required keys
+        or instantiation/loading fails. This keeps behavior deterministic and avoids masking
+        programming errors with broad exception handlers.
         """
-        model = model_cls.load_from_checkpoint(checkpoint_path_str)
+        # Load checkpoint file
+        ckpt = torch.load(checkpoint_path_str, map_location='cpu')
+
+        hparams = ckpt['hparams']
+        state_dict = ckpt['model_state_dict']
+
+        hparams = dict(hparams)
+        # Validate hparams contains required constructor args for LittleMLP
+        required_keys = {'input_size', 'hidden_size', 'num_layers', 'num_classes', 'lr'}
+        if not required_keys.issubset(set(hparams.keys())):
+            missing = required_keys - set(hparams.keys())
+            raise RuntimeError(f"Checkpoint 'hparams' missing required keys: {sorted(missing)}")
+
+        model = model_cls(
+            input_size=hparams['input_size'],
+            hidden_size=hparams['hidden_size'],
+            num_layers=hparams['num_layers'],
+            num_classes=hparams['num_classes'],
+            lr=hparams.get('lr', TrainingConfig.lr)
+        )
+
+        model.load_state_dict(state_dict)
+        model.hparams = hparams
         model.eval()
         return model
 

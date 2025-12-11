@@ -12,7 +12,6 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import time
 from configs.configs import TrainingConfig
 from preprocessing.preprocess import preprocessing_pipeline_for_wisdm_raw_data
-import shutil
 
 # configure basic logging for CLI/info output
 logging.basicConfig(level=logging.INFO)

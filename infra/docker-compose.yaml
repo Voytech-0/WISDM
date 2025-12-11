@@ -55,6 +55,8 @@ services:
     environment:
       - _AIRFLOW_DB_MIGRATE=true
       - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=true  # note: Disabling authentication completely.
+    env_file:
+      - ../.env
     volumes:
       - ./airflow/dags/:/opt/airflow/dags  # note: Normally you pass DAGs to Airflow in a different way, through CI. Like moving to a Cloud Storage Directory where Airflow is getting the DAGs from.
       - /var/run/docker.sock:/var/run/docker.sock  # note: For local deployment: linking local docker to Airflow
@@ -67,10 +69,13 @@ services:
   mysql:
     image: mysql:8.0
     restart: unless-stopped
+    command: --local-infile=1
     env_file:
       - ../.env
     ports:
       - "3306:3306"
+    environment:
+      - MYSQL_ROOT_HOST=%
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 5s

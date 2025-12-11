@@ -1,9 +1,9 @@
 from airflow import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.providers.docker.operators.docker import DockerOperator
+from docker.types import Mount
 
 from datetime import timedelta
-
 
 default_args = {
     "depends_on_past": False,
@@ -40,6 +40,8 @@ model_training_task = DockerOperator(
         "MYSQL_PASSWORD": "password",
         "MYSQL_DATABASE": "wisdm",
     },
+    # Use docker.types.Mount to mount the named volume `app` into the container at /app/models
+    mounts=[Mount(target="/app", source="infra_app", type="volume")],
     task_id="training",
     dag=dag,
 )

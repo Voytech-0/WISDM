@@ -3,6 +3,8 @@ import time
 import logging
 import pandas as pd
 import polars as pl
+import pymysql
+from pymysql.constants import CLIENT
 from sqlalchemy import create_engine, text
 from flask import Flask, jsonify
 from http import HTTPStatus
@@ -95,7 +97,7 @@ def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) 
     lf_all = []
     for p in paths:
         # scan_csv with eol_char=';' because lines end with ';' in raw files
-        lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char='\n')
+        lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char=';\n')
         # derive sensor/device/subject from filename; we'll keep subject_id column from file
         _, sensor, device = str(p).removesuffix('.txt').split('_')[-3:]
         lf = (
@@ -103,7 +105,7 @@ def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) 
             .with_columns(
                 pl.lit(sensor).alias('sensor'),
                 pl.lit(device).alias('device'),
-                pl.col('subject_id').str.replace_all(r'^\n', '').alias('subject_id')
+                # pl.col('subject_id').cast(pl.Utf8, strict=False).str.replace_all(r'^\n', '').alias('subject_id')
             )
         )
         lf_all.append(lf)
@@ -130,7 +132,9 @@ def parse_and_insert(engine, prefix_path: str):
     expected_cols = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z', 'sensor', 'device']
     missing = [c for c in expected_cols if c not in df_pl.columns]
     if missing:
-        logging.warning(f"Missing expected columns after collection: {missing}. Attempting to continue with available columns.")
+        logging.warning(f"Missing expected columns: {missing}. Filling with nulls.")
+        # Add missing columns with null values
+        df_pl = df_pl.with_columns([pl.lit(None).alias(c) for c in missing])
 
     # Coerce numeric columns (non-strict)
     df_pl = df_pl.with_columns([
@@ -140,99 +144,78 @@ def parse_and_insert(engine, prefix_path: str):
         pl.col('z').cast(pl.Float64, strict=False),
     ])
 
-    # keep only 1000 first
-    # FIXME: use full dataset later
-    df_pl = df_pl.head(1000000)
+    df_pl = df_pl.select(expected_cols)
 
-    # Convert to pandas for the existing SQL insertion path
-    logging.info("Converting Polars DataFrame to pandas for DB insertion...")
-    df = df_pl.to_pandas()
-
-    # coerce numeric columns again in pandas to be safe
-    for c in ['timestamp', 'x', 'y', 'z']:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-
-    # keep only expected columns if present, fill missing with nulls
-    for c in expected_cols:
-        if c not in df.columns:
-            df[c] = None
-    df = df[expected_cols]
-
-    # Try a fast bulk insert using LOAD DATA LOCAL INFILE if possible; fall back to pandas.to_sql
     try:
-        inserted = False
-        try:
-            inserted = insert_using_load_data(engine, df, table_name='wisdm_raw')
-        except Exception as e:
-            logging.debug(f"Fast bulk load failed or unavailable: {e}; falling back to pandas.to_sql")
-
-        if not inserted:
-            logging.info(f"Appending {len(df)} rows to wisdm_raw using pandas.to_sql")
-            # chunked multi-row insert to avoid huge single statements
-            df.to_sql('wisdm_raw', con=engine, if_exists='append', index=False, method='multi', chunksize=10000)
-            logging.info(f"Appended {len(df)} rows to wisdm_raw using pandas.to_sql.")
+        insert_using_load_data(engine, df_pl, table_name='wisdm_raw')
     except Exception as e:
         logging.exception(f"Failed to append aggregated data into DB: {e}")
         raise
 
-
-def insert_using_load_data(engine, df: 'pd.DataFrame', table_name: str = 'wisdm_raw') -> bool:
-    """Attempt to bulk-load the dataframe into MySQL using LOAD DATA LOCAL INFILE.
-
-    Returns True on success. Raises on fatal errors. If the server doesn't allow LOCAL INFILE
-    this function will raise and the caller will fall back to another method.
+def insert_using_load_data(engine, df: pl.DataFrame, table_name: str = 'wisdm_raw') -> bool:
+    """
+    Bulk-load Polars DataFrame into MySQL using LOAD DATA LOCAL INFILE.
     """
     import tempfile
     import os
 
-    if df.empty:
+    if df.height == 0:
         logging.info("DataFrame is empty, nothing to insert")
         return True
 
-    # Write to a temporary CSV file. Use \N for NULLs which MySQL treats as NULL by default.
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, newline='')
+    # Create temp file
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
     tmp_name = tmp.name
+    tmp.close()  # Close file handle so Polars can open it
+
     try:
-        # Use comma separator and quote minimal fields to be safe
-        df.to_csv(tmp_name, index=False, sep=',', na_rep='\\N', quoting=1)
-        tmp.close()
+        logging.info("Writing Polars DataFrame to CSV...")
+        df.write_csv(
+            tmp_name,
+            include_header=True,
+            separator=',',
+            quote_style='always',  # Equivalent to quoting=1 (QUOTE_ALL)
+            null_value='\\N'       # MySQL standard for NULL
+        )
 
-        # Ensure path quoting for LOAD DATA
+        # Prepare SQL paths and columns
         path_for_sql = tmp_name.replace('\\', '\\\\')
-
-        # Build column list matching our table schema; ensure order matches CSV header
-        cols = list(df.columns)
+        cols = df.columns
         cols_sql = ','.join(f'`{c}`' for c in cols)
 
         conn = None
         cursor = None
         try:
-            conn = engine.raw_connection()
+            conn = pymysql.connect(
+                host=MySQLConfig.host,
+                user=MySQLConfig.user,
+                password=MySQLConfig.password,
+                database=MySQLConfig.db,
+                port=int(MySQLConfig.port),
+                local_infile=True, # Enables client capability
+                autocommit=False,
+            )
             cursor = conn.cursor()
-            # Use LOCAL because the file is on the client side
-            # Build the LOAD DATA LOCAL INFILE statement using format(); ENCLOSED BY '"' is escaped
+
+            try:
+                cursor.execute("SET SESSION local_infile = 1;")
+            except Exception as exc:
+                logging.debug(f"Could not enable session local_infile: {exc}")
+
             sql = (
                 "LOAD DATA LOCAL INFILE '{}' INTO TABLE {} "
                 "FIELDS TERMINATED BY ',' ENCLOSED BY '\"' "
                 "LINES TERMINATED BY '\\n' IGNORE 1 LINES "
                 "({});"
             ).format(path_for_sql, table_name, cols_sql)
-            logging.info(f"Running bulk LOAD DATA LOCAL INFILE for {len(df)} rows")
+
+            logging.info(f"Running bulk LOAD DATA LOCAL INFILE for {df.height} rows")
             cursor.execute(sql)
             conn.commit()
             return True
         finally:
-            if cursor is not None:
-                try:
-                    cursor.close()
-                except Exception:
-                    pass
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            if cursor: cursor.close()
+            if conn: conn.close()
     finally:
         try:
             os.unlink(tmp_name)
@@ -379,5 +362,3 @@ def populate_endpoint():
     t = threading.Thread(target=_background_populate, daemon=True)
     t.start()
     return jsonify({'started': True}), HTTPStatus.ACCEPTED
-
-

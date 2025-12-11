@@ -11,6 +11,3 @@ ENV PYTHONPATH=/db_init/
 COPY data/wisdm-dataset/raw/ data/wisdm-dataset/raw/
 COPY db_init/ db_init/
 COPY configs/ configs/
-
-
-
