@@ -100,6 +100,7 @@ def parse_args():
     p.add_argument("--count", default=0, type=int, help="How many POSTs to send (0 = forever)")
     p.add_argument("--seed", default=None, type=int, help="Optional random seed for reproducibility")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
+    p.add_argument("--use-local", action="store_true", help="Use local WISDM files and preprocessing pipeline instead of generating synthetic series")
     return p.parse_args()
 
 
@@ -121,10 +122,45 @@ def main():
 
     sent = 0
     try:
+        # If requested, load local data via the preprocessing helpers instead of generating synthetic series
+        local_rows = None
+        if args.use_local:
+            try:
+                import src.preprocessing.preprocess as preprocess
+            except Exception as exc:
+                logging.exception("Failed to import preprocessing helpers: %s", exc)
+                sys.exit(2)
+
+            lf = preprocess.load_raw_data_from_local()
+            if lf is None:
+                logging.error("No local data found under DataConfig.data_path_prefix=%s", getattr(preprocess.DataConfig, 'data_path_prefix', None))
+                sys.exit(2)
+
+            lf = preprocess.raw_data_into_xyz_series(lf)
+            lf = preprocess.convert_data_to_10_seconds_intervals(lf)
+            # collect into list of dict rows (each row has x,y,z lists and device/sensor metadata)
+            try:
+                local_rows = lf.collect().to_dicts()
+            except Exception as exc:
+                logging.exception("Failed to collect/preprocess local rows: %s", exc)
+                sys.exit(2)
+
+            if not local_rows:
+                logging.error("No rows produced by preprocessing of local data")
+                sys.exit(2)
+
         while True:
             # build payload
-            items = [make_item(random.choice(devices), random.choice(sensors), args.series_len) for _ in range(args.batch_size)]
-            payload = items[0] if args.batch_size == 1 else items
+            if args.use_local:
+                # pick items from preprocessed rows
+                items = [
+                    {"device": r.get("device"), "sensor": r.get("sensor"), "x": r.get("x"), "y": r.get("y"), "z": r.get("z")}
+                    for r in random.choices(local_rows, k=args.batch_size)
+                ]
+                payload = items[0] if args.batch_size == 1 else items
+            else:
+                items = [make_item(random.choice(devices), random.choice(sensors), args.series_len) for _ in range(args.batch_size)]
+                payload = items[0] if args.batch_size == 1 else items
 
             logging.debug("Payload keys: %s; first x[0]=%.3f", list(items[0].keys()), items[0]["x"][0])
 

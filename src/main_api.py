@@ -20,6 +20,20 @@ from preprocessing.preprocess import expand_raw_items_to_expanded_df
 from prometheus_flask_exporter import PrometheusMetrics
 from prometheus_client import Counter, Histogram
 
+# Module-level Prometheus metrics: created once when module is imported.
+# This prevents duplicate metric registration when create_app() is called multiple times
+# (e.g., during tests or when reloading the app). If you run Flask with multiple
+# worker processes (gunicorn), consider using the Prometheus Python client
+# multiprocess mode (set PROMETHEUS_MULTIPROC_DIR) or a Pushgateway.
+request_counter = Counter(
+    'api_requests_total', 'Total API requests', ['endpoint', 'method', 'status']
+)
+predict_counter = Counter('predict_requests_total', 'Total /predict requests', ['status'])
+
+request_latency_histogram = Histogram(
+    'request_latency_seconds', 'Request latency histogram in seconds', ['endpoint', 'method', 'status']
+)
+
 
 class ModelLoader:
     """Encapsulates model checkpoint loading.
@@ -195,14 +209,6 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
     # Initialize Prometheus metrics (static imports at top of file)
     metrics = PrometheusMetrics(app)
 
-    request_counter = Counter(
-        'api_requests_total', 'Total API requests', ['endpoint', 'method', 'status']
-    )
-    predict_counter = Counter('predict_requests_total', 'Total /predict requests', ['status'])
-
-    request_latency_histogram = Histogram(
-        'request_latency_seconds', 'Request latency histogram in seconds', ['endpoint', 'method', 'status']
-    )
 
     @app.before_request
     def before_request_timing():
