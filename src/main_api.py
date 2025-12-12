@@ -226,7 +226,6 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
         nonlocal model
         if model is None:
             try:
-                nonlocal model
                 model = model_loader.load()
                 logging.info("Model loaded from checkpoint on /predict request")
             except Exception as e:
