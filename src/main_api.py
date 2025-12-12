@@ -264,14 +264,9 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
                 probs = nn.functional.softmax(logits, dim=1).cpu().numpy().tolist()
                 preds = np.argmax(probs, axis=1).tolist()
             out = [{"pred": int(p), "probs": pr} for p, pr in zip(preds, probs)]
-            # increment a predict-specific counter (if available)
             predict_counter.labels(status='success').inc()
-            try:
-                for p in preds:
-                    predicted_class_counter.labels(predicted_class=str(int(p))).inc()
-            except Exception:
-                # metric increment should never break request handling
-                logging.exception("Failed to increment predicted_class_counter")
+            for p in preds:
+                predicted_class_counter.labels(predicted_class=str(int(p))).inc()
             return jsonify(out)
         except Exception as e:
             logging.error("Error during /predict: %s", e, exc_info=True)

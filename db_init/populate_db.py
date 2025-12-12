@@ -1,14 +1,11 @@
 from pathlib import Path
 import time
 import logging
-import pandas as pd
 import polars as pl
 import pymysql
-from pymysql.constants import CLIENT
 from sqlalchemy import create_engine, text
 from flask import Flask, jsonify
 from http import HTTPStatus
-import threading
 
 from configs.configs import MySQLConfig, DataConfig
 
@@ -69,16 +66,52 @@ def create_status_table(engine):
     with engine.connect() as conn:
         conn.execute(text(q))
 
-def set_status_in_db(engine, key: str, value: str):
-    # Use INSERT ... ON DUPLICATE KEY UPDATE to upsert
-    q = """
+def set_status_in_db(engine=None, key: str = None, value: str = None):
+    """
+    Upsert a key/value into init_status. If no engine is provided, create one and try to write.
+    """
+    if key is None:
+        raise ValueError("key is required")
+
+    created_engine = False
+    if engine is None:
+        engine = get_engine()
+        created_engine = True
+        if not wait_for_db(engine, timeout_s=10):
+            raise RuntimeError("Database not available to set status")
+
+    query = """
     INSERT INTO init_status (`key`, `value`) VALUES (:k, :v)
     ON DUPLICATE KEY UPDATE `value` = :v, updated_at = CURRENT_TIMESTAMP;
     """
-    with engine.connect() as conn:
-        conn.execute(text(q), {"k": key, "v": value})
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(query), {"k": key, "v": value})
+    finally:
+        # If we created the engine locally, dispose it to free resources
+        if created_engine:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
 
-def get_status_from_db(engine, key: str) -> str | None:
+
+def get_status_from_db(engine=None, key: str = None) -> str | None:
+    """
+    Read a value from init_status. If no engine is provided, create one and try briefly.
+    Returns the stored string value or None if not present / not reachable.
+    """
+    if key is None:
+        raise ValueError("key is required")
+
+    created_engine = False
+    if engine is None:
+        engine = get_engine()
+        created_engine = True
+        if not wait_for_db(engine, timeout_s=5):
+            logging.debug("DB not available when reading status")
+            return None
+
     q = "SELECT `value` FROM init_status WHERE `key` = :k LIMIT 1"
     try:
         with engine.connect() as conn:
@@ -87,7 +120,14 @@ def get_status_from_db(engine, key: str) -> str | None:
                 return r[0]
     except Exception:
         logging.debug("Could not read init_status from DB (it may not be ready)")
+    finally:
+        if created_engine:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
     return None
+
 
 def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) -> pl.LazyFrame:
     file_header = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
@@ -113,6 +153,7 @@ def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) 
     lf_all = pl.concat(lf_all).drop_nulls()
 
     return lf_all
+
 
 def parse_and_insert(engine, prefix_path: str):
     if not Path(prefix_path).exists():
@@ -151,6 +192,7 @@ def parse_and_insert(engine, prefix_path: str):
     except Exception as e:
         logging.exception(f"Failed to append aggregated data into DB: {e}")
         raise
+
 
 def insert_using_load_data(engine, df: pl.DataFrame, table_name: str = 'wisdm_raw') -> bool:
     """
@@ -223,142 +265,95 @@ def insert_using_load_data(engine, df: pl.DataFrame, table_name: str = 'wisdm_ra
             pass
     return False
 
-# module-level cached status and running flag
-_is_populated = False
-_is_running = False
-_status_lock = threading.Lock()
 
 def is_populated():
-    with _status_lock:
-        return _is_populated
+    """Read persisted populated state from the DB."""
+    try:
+        engine = get_engine()
+        if not wait_for_db(engine, timeout_s=5):
+            return False
+        val = get_status_from_db(engine, 'is_populated')
+        return val in ('1', 'true', 'True')
+    except Exception:
+        logging.debug('Could not determine persisted populate status')
+        return False
 
-def is_running():
-    with _status_lock:
-        return _is_running
 
-def _set_populated(val: bool):
-    global _is_populated
-    with _status_lock:
-        _is_populated = bool(val)
+def populate(prefix_path: str = None) -> tuple[bool, str]:
+    """
+    Populate the database from raw files. Returns (success: bool, reason: str).
 
-def _set_running(val: bool):
-    global _is_running
-    with _status_lock:
-        _is_running = bool(val)
-
-def populate(prefix_path: str = None):
+    success == True indicates the database is populated (either already or after this call).
+    success == False indicates the operation did not populate the DB (e.g., lock not acquired or error).
+    """
     if prefix_path is None:
         prefix_path = DataConfig.data_path_prefix
 
-    _set_populated(False)
     engine = get_engine()
 
     if not wait_for_db(engine, timeout_s=120):
-        raise RuntimeError("Database did not become available in time")
+        return (False, "db_unavailable")
 
     try:
         create_status_table(engine)
     except Exception:
         logging.debug('Could not create init_status table before reading status')
 
-    # Acquire a named lock and hold it for the whole populate operation to prevent
-    # concurrent population across multiple containers.
-    lock_name = 'wisdm_populate_lock'
-    lock_conn = None
-    got_lock = False
+    # Run the populate operation (no locking, single-instance assumption)
     try:
-        lock_conn = engine.connect()
-        try:
-            got_lock = bool(lock_conn.execute(text("SELECT GET_LOCK(:name, :timeout)"), {"name": lock_name, "timeout": 10}).scalar())
-        except Exception:
-            got_lock = False
-
-        if not got_lock:
-            logging.info("Another instance is populating (couldn't acquire lock); exiting")
-            return
-
         # If the DB already has is_populated=1, honor it and skip re-population.
         try:
             persisted = get_status_from_db(engine, 'is_populated')
             if persisted in ('1', 'true', 'True'):
                 logging.info('Database already populated according to init_status; skipping populate')
-                _set_populated(True)
-                return
+                return (True, 'already_populated')
         except Exception:
             logging.debug('Could not read persisted is_populated flag before populate')
 
-        # Run the populate while we hold the lock
         create_table(engine)
         parse_and_insert(engine, prefix_path)
-        _set_populated(True)
         try:
             logging.info("Putting is_populated flag to DB")
             set_status_in_db(engine, 'is_populated', '1')
         except Exception:
             logging.exception('Failed to persist is_populated flag to DB')
 
-    except Exception:
-        logging.exception('Error during populate with locking')
-        return
-    finally:
-        # release lock if we acquired it
-        try:
-            if lock_conn is not None:
-                lock_conn.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
-                lock_conn.close()
-        except Exception:
-            logging.debug('Failed to release populate lock')
+    except Exception as exc:
+        logging.exception('Error during populate')
+        return (False, f'error:{exc}')
 
     logging.info("Finished populating database")
+    return (True, 'populated')
+
 
 logger.info("Starting flask app.")
 app = Flask(__name__)
 
-# On module import try to read persisted populated state from DB (best-effort, short timeout).
-try:
-    _init_engine = get_engine()
-    if wait_for_db(_init_engine, timeout_s=5):
-        val = get_status_from_db(_init_engine, 'is_populated')
-        if val is not None:
-            _set_populated(val in ('1', 'true', 'True'))
-except Exception:
-    # If DB isn't available at import time that's fine; status stays False until updated.
-    logging.debug('Could not determine persisted populate status at import time')
-
-def _background_populate(prefix_path: str = None):
-    try:
-        _set_running(True)
-        populate(prefix_path)
-    except Exception as exc:
-        logging.exception(f"Background populate failed: {exc}")
-    finally:
-        _set_running(False)
 
 @app.route('/status', methods=['GET'])
 def status_endpoint():
-    return jsonify({'is_populated': is_populated(), 'is_running': is_running()}), HTTPStatus.OK
+    return jsonify({'is_populated': is_populated()}), HTTPStatus.OK
+
 
 @app.route('/populate', methods=['GET'])
 def populate_endpoint():
-    if is_running():
-        return jsonify({'error': 'Populate already running'}), HTTPStatus.CONFLICT
-
     # Prefer persisted status in DB if available
     try:
         engine = get_engine()
         if wait_for_db(engine, timeout_s=5):
             persisted = get_status_from_db(engine, 'is_populated')
             if persisted in ('1', 'true', 'True'):
-                _set_populated(True)
-                return jsonify({'started': False, 'reason': 'already populated (persisted)'}), HTTPStatus.CONFLICT
+                return jsonify({'started': False, 'populated': True, 'reason': 'already_populated'}), HTTPStatus.OK
     except Exception:
-        logging.debug('Could not check persisted populate status; falling back to in-memory flag')
+        logging.debug('Could not check persisted populate status; falling back to direct populate')
 
-    # fall back to in-memory cached flag
-    if is_populated():
-        return jsonify({'started': False, 'reason': 'already populated (in-memory)'}), HTTPStatus.CONFLICT
+    success, reason = populate()
+    if success:
+        return jsonify({'started': True, 'populated': True, 'reason': reason}), HTTPStatus.OK
 
-    # start background job using configured DataConfig path
-    t = threading.Thread(target=_background_populate, daemon=True)
-    t.start()
-    return jsonify({'started': True}), HTTPStatus.ACCEPTED
+    if reason == 'db_unavailable':
+        return jsonify({'error': 'Database unavailable during populate attempt'}), HTTPStatus.SERVICE_UNAVAILABLE
+
+    logging.error('Populate failed: %s', reason)
+    return jsonify({'error': f'Populate failed: {reason}'}), HTTPStatus.INTERNAL_SERVER_ERROR
+
