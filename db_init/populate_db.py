@@ -1,3 +1,5 @@
+import os
+import tempfile
 from pathlib import Path
 import time
 import logging
@@ -14,10 +16,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 FILE_HEADER = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
 
-def get_engine():
-    url = f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
-    # enable local_infile so we can use LOAD DATA LOCAL INFILE for much faster bulk loads when available
-    return create_engine(url, connect_args={"local_infile": 1})
+ENGINE = None
+
+
+def get_connected_engine(timeout_s: int = 60):
+    """
+    Create (lazily) and return the module-level SQLAlchemy engine, and wait until the DB is available.
+    Raises RuntimeError if the DB is not available within timeout_s.
+    """
+    global ENGINE
+    if ENGINE is None:
+        url = f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
+        ENGINE = create_engine(url, connect_args={"local_infile": 1})
+
+    if not wait_for_db(ENGINE, timeout_s=timeout_s):
+        raise RuntimeError("Database not available")
+
+    return ENGINE
 
 
 def wait_for_db(engine, timeout_s=60):
@@ -54,6 +69,7 @@ def create_table(engine):
         conn.execute(text(create_table_query))
     logging.info("Ensured table wisdm_raw exists.")
 
+
 def create_status_table(engine):
     """Create a small key/value table to persist init status across container restarts."""
     q = """
@@ -66,51 +82,36 @@ def create_status_table(engine):
     with engine.connect() as conn:
         conn.execute(text(q))
 
-def set_status_in_db(engine=None, key: str = None, value: str = None):
+
+def set_status_in_db(key: str = None, value: str = None):
     """
-    Upsert a key/value into init_status. If no engine is provided, create one and try to write.
+    Upsert a key/value into init_status. Uses the shared connected engine.
     """
     if key is None:
         raise ValueError("key is required")
 
-    created_engine = False
-    if engine is None:
-        engine = get_engine()
-        created_engine = True
-        if not wait_for_db(engine, timeout_s=10):
-            raise RuntimeError("Database not available to set status")
+    engine = get_connected_engine(timeout_s=10)
 
     query = """
     INSERT INTO init_status (`key`, `value`) VALUES (:k, :v)
     ON DUPLICATE KEY UPDATE `value` = :v, updated_at = CURRENT_TIMESTAMP;
     """
-    try:
-        with engine.connect() as conn:
-            conn.execute(text(query), {"k": key, "v": value})
-    finally:
-        # If we created the engine locally, dispose it to free resources
-        if created_engine:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
+    with engine.connect() as conn:
+        conn.execute(text(query), {"k": key, "v": value})
 
 
-def get_status_from_db(engine=None, key: str = None) -> str | None:
+def get_status_from_db(key: str = None) -> str | None:
     """
-    Read a value from init_status. If no engine is provided, create one and try briefly.
-    Returns the stored string value or None if not present / not reachable.
+    Read a value from init_status. Returns the stored string value or None if not present / not reachable.
     """
     if key is None:
         raise ValueError("key is required")
 
-    created_engine = False
-    if engine is None:
-        engine = get_engine()
-        created_engine = True
-        if not wait_for_db(engine, timeout_s=5):
-            logging.debug("DB not available when reading status")
-            return None
+    try:
+        engine = get_connected_engine(timeout_s=5)
+    except Exception:
+        logging.debug("DB not available when reading status")
+        return None
 
     q = "SELECT `value` FROM init_status WHERE `key` = :k LIMIT 1"
     try:
@@ -120,12 +121,6 @@ def get_status_from_db(engine=None, key: str = None) -> str | None:
                 return r[0]
     except Exception:
         logging.debug("Could not read init_status from DB (it may not be ready)")
-    finally:
-        if created_engine:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
     return None
 
 
@@ -136,16 +131,13 @@ def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) 
 
     lf_all = []
     for p in paths:
-        # scan_csv with eol_char=';' because lines end with ';' in raw files
         lf = pl.scan_csv(str(p), has_header=False, new_columns=file_header, eol_char=';\n')
-        # derive sensor/device/subject from filename; we'll keep subject_id column from file
         _, sensor, device = str(p).removesuffix('.txt').split('_')[-3:]
         lf = (
             lf
             .with_columns(
                 pl.lit(sensor).alias('sensor'),
                 pl.lit(device).alias('device'),
-                # pl.col('subject_id').cast(pl.Utf8, strict=False).str.replace_all(r'^\n', '').alias('subject_id')
             )
         )
         lf_all.append(lf)
@@ -155,7 +147,7 @@ def load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path: str) 
     return lf_all
 
 
-def parse_and_insert(engine, prefix_path: str):
+def parse_and_insert(prefix_path: str):
     if not Path(prefix_path).exists():
         raise FileNotFoundError(f"Raw data folder not found at {prefix_path}")
 
@@ -169,15 +161,12 @@ def parse_and_insert(engine, prefix_path: str):
         logging.exception(f"Failed to collect LazyFrame: {e}")
         raise
 
-    # Ensure expected columns exist
     expected_cols = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z', 'sensor', 'device']
     missing = [c for c in expected_cols if c not in df_pl.columns]
     if missing:
         logging.warning(f"Missing expected columns: {missing}. Filling with nulls.")
-        # Add missing columns with null values
         df_pl = df_pl.with_columns([pl.lit(None).alias(c) for c in missing])
 
-    # Coerce numeric columns (non-strict)
     df_pl = df_pl.with_columns([
         pl.col('timestamp').cast(pl.Int64, strict=False),
         pl.col('x').cast(pl.Float64, strict=False),
@@ -188,27 +177,24 @@ def parse_and_insert(engine, prefix_path: str):
     df_pl = df_pl.select(expected_cols)
 
     try:
-        insert_using_load_data(engine, df_pl, table_name='wisdm_raw')
+        insert_using_load_data(df_pl, table_name='wisdm_raw')
     except Exception as e:
         logging.exception(f"Failed to append aggregated data into DB: {e}")
         raise
 
 
-def insert_using_load_data(engine, df: pl.DataFrame, table_name: str = 'wisdm_raw') -> bool:
+def insert_using_load_data(df: pl.DataFrame, table_name: str = 'wisdm_raw') -> bool:
     """
     Bulk-load Polars DataFrame into MySQL using LOAD DATA LOCAL INFILE.
     """
-    import tempfile
-    import os
 
     if df.height == 0:
         logging.info("DataFrame is empty, nothing to insert")
         return True
 
-    # Create temp file
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
     tmp_name = tmp.name
-    tmp.close()  # Close file handle so Polars can open it
+    tmp.close()
 
     try:
         logging.info("Writing Polars DataFrame to CSV...")
@@ -216,11 +202,10 @@ def insert_using_load_data(engine, df: pl.DataFrame, table_name: str = 'wisdm_ra
             tmp_name,
             include_header=True,
             separator=',',
-            quote_style='always',  # Equivalent to quoting=1 (QUOTE_ALL)
-            null_value='\\N'       # MySQL standard for NULL
+            quote_style='always',
+            null_value='\\N'
         )
 
-        # Prepare SQL paths and columns
         path_for_sql = tmp_name.replace('\\', '\\\\')
         cols = df.columns
         cols_sql = ','.join(f'`{c}`' for c in cols)
@@ -267,12 +252,8 @@ def insert_using_load_data(engine, df: pl.DataFrame, table_name: str = 'wisdm_ra
 
 
 def is_populated():
-    """Read persisted populated state from the DB."""
     try:
-        engine = get_engine()
-        if not wait_for_db(engine, timeout_s=5):
-            return False
-        val = get_status_from_db(engine, 'is_populated')
+        val = get_status_from_db('is_populated')
         return val in ('1', 'true', 'True')
     except Exception:
         logging.debug('Could not determine persisted populate status')
@@ -289,9 +270,9 @@ def populate(prefix_path: str = None) -> tuple[bool, str]:
     if prefix_path is None:
         prefix_path = DataConfig.data_path_prefix
 
-    engine = get_engine()
-
-    if not wait_for_db(engine, timeout_s=120):
+    try:
+        engine = get_connected_engine(timeout_s=120)
+    except Exception:
         return (False, "db_unavailable")
 
     try:
@@ -299,22 +280,17 @@ def populate(prefix_path: str = None) -> tuple[bool, str]:
     except Exception:
         logging.debug('Could not create init_status table before reading status')
 
-    # Run the populate operation (no locking, single-instance assumption)
     try:
-        # If the DB already has is_populated=1, honor it and skip re-population.
-        try:
-            persisted = get_status_from_db(engine, 'is_populated')
-            if persisted in ('1', 'true', 'True'):
-                logging.info('Database already populated according to init_status; skipping populate')
-                return (True, 'already_populated')
-        except Exception:
-            logging.debug('Could not read persisted is_populated flag before populate')
+        persisted = get_status_from_db('is_populated')
+        if persisted in ('1', 'true', 'True'):
+            logging.info('Database already populated according to init_status; skipping populate')
+            return (True, 'already_populated')
 
         create_table(engine)
-        parse_and_insert(engine, prefix_path)
+        parse_and_insert(prefix_path)
         try:
             logging.info("Putting is_populated flag to DB")
-            set_status_in_db(engine, 'is_populated', '1')
+            set_status_in_db('is_populated', '1')
         except Exception:
             logging.exception('Failed to persist is_populated flag to DB')
 
@@ -337,15 +313,13 @@ def status_endpoint():
 
 @app.route('/populate', methods=['GET'])
 def populate_endpoint():
-    # Prefer persisted status in DB if available
+
     try:
-        engine = get_engine()
-        if wait_for_db(engine, timeout_s=5):
-            persisted = get_status_from_db(engine, 'is_populated')
-            if persisted in ('1', 'true', 'True'):
-                return jsonify({'started': False, 'populated': True, 'reason': 'already_populated'}), HTTPStatus.OK
+        persisted = get_status_from_db('is_populated')
+        if persisted in ('1', 'true', 'True'):
+            return jsonify({'started': False, 'populated': True, 'reason': 'already_populated'}), HTTPStatus.OK
     except Exception:
-        logging.debug('Could not check persisted populate status; falling back to direct populate')
+        logging.debug('Population status unknown at start of /populate')
 
     success, reason = populate()
     if success:
@@ -356,4 +330,3 @@ def populate_endpoint():
 
     logging.error('Populate failed: %s', reason)
     return jsonify({'error': f'Populate failed: {reason}'}), HTTPStatus.INTERNAL_SERVER_ERROR
-
