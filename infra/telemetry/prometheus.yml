@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 2s
+scrape_configs:
+ - job_name: prometheus
+   static_configs:
+    - targets:
+       - prometheus:9090
+ - job_name: wisdm
+#   scrape_interval: 5s
+#   metrics_path: /metrics
+   static_configs:
+     - targets:
+       - app:8000
+   relabel_configs:
+     - source_labels: [__address__]
+       target_label: instance
+ - job_name: prometheus_push_gateway
+   honor_labels: true
+   static_configs:
+     - targets:
+       - prometheus_push_gateway:9091
+rule_files:
+  - "/etc/prometheus/alerts.yml"
