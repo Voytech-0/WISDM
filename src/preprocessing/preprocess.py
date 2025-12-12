@@ -24,9 +24,6 @@ from configs.configs import DataConfig, PathsConfig, MySQLConfig
 
 def wait_for_mysql(engine, timeout: int = 30, interval: float = 1.0):
     """Wait until a connection to the database can be established.
-
-    Tries to connect repeatedly until success or until timeout seconds have elapsed.
-    Prints progress and raises the last exception on timeout.
     """
     start = time.time()
     attempt = 0
@@ -50,7 +47,11 @@ def wait_for_mysql(engine, timeout: int = 30, interval: float = 1.0):
             logging.warning("MySQL not ready (attempt=%d), sleeping %.1fs: %s", attempt, sleep_for, exc)
             time.sleep(sleep_for)
 
-def load_raw_data_from_local():
+def load_raw_data_from_local() -> Optional[pl.LazyFrame]:
+    """
+    Load raw data files from local filesystem into a Polars LazyFrame.
+    :return: A LazyFrame with columns: subject_id, label, timestamp, x, y, z, sensor, device, or None if no files found.
+    """
     prefix_path = DataConfig.data_path_prefix
     file_header = ['subject_id', 'label', 'timestamp', 'x', 'y', 'z']
 
@@ -78,14 +79,18 @@ def load_raw_data_from_local():
     return lf_all
 
 def load_raw_data_from_mysql() -> pl.LazyFrame:
+    """
+    Load raw data from MySQL database into a Polars LazyFrame.
+    :return: A LazyFrame with columns: subject_id, label, timestamp, x, y, z, sensor, device, or None if no files found.
+    """
 
     logging.info("user %s connecting to %s:%s database %s", MySQLConfig.user, MySQLConfig.host, MySQLConfig.port,
                  MySQLConfig.db)
     engine = create_engine(
         f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
     )
-    # wait for database to accept connections before executing the query
     wait_for_mysql(engine, timeout=DataConfig.db_connect_timeout if hasattr(DataConfig, 'db_connect_timeout') else 30)
+
     query = "SELECT subject_id, label, timestamp, x, y, z, sensor, device FROM wisdm_raw"
 
     chunk_size = int(getattr(DataConfig, 'db_read_chunk_size', 10000))
@@ -110,11 +115,11 @@ def load_raw_data_from_mysql() -> pl.LazyFrame:
         df = pl.DataFrame([], schema=cols if cols is not None else [])
         return df.lazy()
 
-    # Concatenate all chunk DataFrames
     df = pl.concat(frames, how='vertical')
 
     # drop prefix '\n' from subject_id if present
     # should not be necessary if data ingestion is correct, but added because of prior error
+    # Currently should not be needed but is left for safety
     df = df.with_columns([
         pl.col('subject_id').str.replace_all(r'^\n', '').alias('subject_id')
     ])
@@ -125,9 +130,10 @@ def raw_data_into_xyz_series(lf: pl.LazyFrame) -> pl.LazyFrame:
     """
     Returns a polars LazyFrame where each row corresponds to one (subject_id, device, sensor, label)
     and the columns x,y,z are lists of values ordered by timestamp.
+    :param lf: Input LazyFrame with columns: subject_id, device, sensor, label, timestamp, x (float), y (float), z (float)
+    :return: A LazyFrame with columns: subject_id, device, sensor, label, x (list), y (list), z (list)
     """
 
-    # Ensure numeric types for timestamp,x,y,z and drop incomplete rows
     lf = lf.with_columns([
         pl.col('timestamp').cast(pl.Float64).alias('timestamp'),
         pl.col('x').cast(pl.Float64).alias('x'),
@@ -135,10 +141,10 @@ def raw_data_into_xyz_series(lf: pl.LazyFrame) -> pl.LazyFrame:
         pl.col('z').cast(pl.Float64).alias('z'),
     ]).filter(pl.col('z').is_not_null())
 
-    # sort by timestamp to preserve ordering within groups
+    # sort by timestamp to preserve ordering within groups.
+    # Optional for local files but might be needed for SQL data.
     lf = lf.sort(['subject_id', 'device', 'sensor', 'label', 'timestamp'])
 
-    # group and aggregate x,y,z into lists (maintain order)
     grouped = (
         lf
         .group_by(['subject_id', 'device', 'sensor', 'label'], maintain_order=True)
@@ -153,7 +159,13 @@ def raw_data_into_xyz_series(lf: pl.LazyFrame) -> pl.LazyFrame:
 
 
 
-def convert_data_to_10_seconds_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
+def convert_data_to_fixed_length_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Convert the LazyFrame of raw data into fixed-length intervals of x,y,z data.
+    Each row in the output corresponds to one fixed-length interval (e.g. 10s at 20Hz = 200 samples).
+    :param lf: Input LazyFrame with columns: subject_id, device, sensor, label, x (list), y (list), z (list)
+    :return: A LazyFrame with columns: subject_id, device, sensor, label, x (list), y (list), z (list) but chunked into fixed-length intervals.
+    """
     # for each 'subject_id', 'device' 'sensor', 'label', create lists of', 'x', 'y', 'z'
     assert lf is not None, "timeseries cannot be computed for None or empty"
     names = set(lf.collect_schema().names())
@@ -207,6 +219,10 @@ def set_z_score_stats(stats: pl.LazyFrame):
 def apply_z_score_normalization(lf: pl.LazyFrame, train: bool = False, group_columns=None) -> pl.LazyFrame:
     """
     Normalize each axis (x,y,z) per device, sensor, participant using z-score.
+    :param lf: Input LazyFrame with columns: subject_id, device, sensor, label, x (list), y (list), z (list)
+    :param train: If True, compute and store z-score stats from this data. If False, load existing stats.
+    :param group_columns: List of columns to group by when computing z-score stats. Default: ['device', 'sensor']
+    :return: A LazyFrame with the same columns as input, but with x,y,z normalized.
     """
     assert lf is not None
 
@@ -266,45 +282,14 @@ def apply_z_score_normalization(lf: pl.LazyFrame, train: bool = False, group_col
 
     return lf_norm
 
-def _source_target_split(df: pl.DataFrame, target_prefix ="label"):
-    all_column_names = df.collect_schema().names()
-    label_cols = [col for col in all_column_names if col.startswith(target_prefix)]
-    feature_cols = [col for col in all_column_names if col not in label_cols]
-    return df.select(feature_cols), df.select(label_cols)
-
-def generate_splits(df: pl.DataFrame):
-    """
-    
-    :param df:
-    :return:
-    """
-    n = df.height
-    train_end = int(n * DataConfig.train_split)
-    val_end = train_end + int(n * DataConfig.validation_split)
-    df_train = df.slice(0, train_end)
-    df_val = df.slice(train_end, val_end - train_end)
-    df_test = df.slice(val_end, n - val_end)
-    output_dict = {}
-    for split in ['train', 'validation', 'test']:
-        if split == 'train':
-            df_split = df_train
-        elif split == 'validation':
-            df_split = df_val
-        else:
-            df_split = df_test
-        X, y = _source_target_split(df_split)
-        output_dict[split] = {'X': X, 'y': y}
-    return output_dict
-
 
 def expand_lists(df: pl.DataFrame, list_cols: List[str]) -> pl.DataFrame:
-    """Expand list-valued columns in `df` into separate scalar columns using Polars.
-
-    For each column name in `list_cols` the function creates columns
-    {col}_0 ... {col}_{L-1} where L is the maximum list length defined in conf.
-    Shorter lists produce nulls in the corresponding positions.
-
-    Returns a new DataFrame with the original list columns dropped.
+    """
+    Expand list columns into multiple scalar columns. (one-hot style)
+    E.g. column 'x' with list of length 200 becomes columns x_0, x_1, ..., x_199.
+    :param df: Input DataFrame with list columns to expand.
+    :param list_cols: List of column names to expand.
+    :return: A DataFrame with the specified list columns expanded into scalar columns.
     """
     # 1. Determine the maximum length (L)
     max_length = DataConfig.feature_length_in_seconds * DataConfig.frequency
@@ -313,29 +298,16 @@ def expand_lists(df: pl.DataFrame, list_cols: List[str]) -> pl.DataFrame:
     expansion_expressions = []
 
     for col in list_cols:
-        # 2. Create the Polars expression for padding/truncating
-        # This expression ensures all lists are exactly 'max_length' long.
         list_expression = (
-            # 2a. Pad the list to at least 'max_length' with nulls.
             pl.col(col).list.to_array(max_length).cast(pl.List)
-            # 2b. Truncate (slice) the list to exactly 'max_length'.
-            # Note: The combination of pl.list.to_array() and pl.list.slice()
-            # or pl.list.to_array().cast(pl.List) handles both padding and truncation implicitly
-            # and efficiently. pl.list.to_array() handles the max length and padding with nulls.
         )
 
-        # 3. Convert the padded/truncated list into a Struct
-        # This allows us to flatten it into multiple columns in the next step.
         struct_expression = list_expression.list.to_struct(
-            # Generate field names: {col}_0, {col}_1, ...
             fields=[f'{col}_{i}' for i in range(max_length)],
-            # The 'n_field_strategy' here is essential for padding shorter lists
-            # and is handled by pl.list.to_array().
         ).alias(f'{col}_struct')
 
         expansion_expressions.append(struct_expression)
 
-    # 4. Add the new Struct columns and unnest them
     df_expanded = (
         df.with_columns(expansion_expressions)
         .unnest([f'{col}_struct' for col in list_cols])
@@ -350,7 +322,7 @@ def preprocessing_pipeline_for_wisdm_raw_data():
     if lf is None:
         lf = load_raw_data_from_mysql()
     lf = raw_data_into_xyz_series(lf)
-    lf = convert_data_to_10_seconds_intervals(lf)
+    lf = convert_data_to_fixed_length_intervals(lf)
     lf = apply_z_score_normalization(lf, train=True)
     # lf = one_hot_encode(lf, ["device", "sensor", "label"])
     # DataFrame from LazyFrame

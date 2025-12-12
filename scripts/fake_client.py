@@ -132,7 +132,7 @@ def main():
                 return
 
             lf = preprocess.raw_data_into_xyz_series(lf)
-            lf = preprocess.convert_data_to_10_seconds_intervals(lf)
+            lf = preprocess.convert_data_to_fixed_length_intervals(lf)
             # collect into list of dict rows (each row has x,y,z lists and device/sensor metadata)
             try:
                 local_rows = lf.collect().to_dicts()

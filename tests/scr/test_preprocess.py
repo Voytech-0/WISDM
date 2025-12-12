@@ -11,15 +11,13 @@ from configs.configs import DataConfig, PathsConfig
 from preprocessing.preprocess import (
     load_raw_data_from_local,
     raw_data_into_xyz_series,
-    convert_data_to_10_seconds_intervals,
+    convert_data_to_fixed_length_intervals,
     apply_z_score_normalization,
-    _source_target_split,
     preprocessing_pipeline_for_wisdm_raw_data,
     build_raw_lazyframe_from_items,
     lazyframe_to_single_10s,
     collect_and_dummify_drop_subject,
     expand_lists,
-    generate_splits,
     expand_raw_items_to_expanded_df,
     set_z_score_stats
 )
@@ -254,7 +252,7 @@ def test_convert_data_to_10_seconds_intervals(monkeypatch):
         }
     ]
     for case in cases:
-        out = convert_data_to_10_seconds_intervals(case["data"])
+        out = convert_data_to_fixed_length_intervals(case["data"])
         pd.testing.assert_frame_equal(
             out.collect().to_pandas(),
             case["expected"].collect().to_pandas(),
@@ -342,42 +340,6 @@ def test_expand_lists(monkeypatch):
         assert set(case["expected_columns"]).issubset(set(out.columns))
         assert "x" not in out.columns
         assert out["x_2"][0] == case["expected_val_x_2"]
-
-
-def test_source_target_split():
-    cases = [
-        {
-            "data": pl.LazyFrame(
-                {
-                    "feature1": [1, 2],
-                    "feature2": [3, 4],
-                    "label_A": [0, 1],
-                    "label_B": [1, 0],
-                }
-            ),
-            "expected_features": ["feature1", "feature2"],
-            "expected_labels": ["label_A", "label_B"],
-        }
-    ]
-    for case in cases:
-        df = case["data"].collect()
-        X, y = _source_target_split(df, target_prefix="label")
-        assert sorted(X.columns) == sorted(case["expected_features"])
-        assert sorted(y.columns) == sorted(case["expected_labels"])
-
-
-def test_generate_splits(monkeypatch):
-    monkeypatch.setattr(DataConfig, "train_split", 0.5)
-    monkeypatch.setattr(DataConfig, "validation_split", 0.3)
-
-    # 10 rows. Train=5, Val=3, Test=2
-    df = pl.DataFrame({"f": range(10), "label_x": range(10)})
-
-    splits = generate_splits(df)
-
-    assert splits["train"]["X"].height == 5
-    assert splits["validation"]["X"].height == 3
-    assert splits["test"]["X"].height == 2
 
 
 def test_lazyframe_to_single_10s(monkeypatch):
