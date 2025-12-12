@@ -9,31 +9,41 @@
     {
       "type": "timeseries",
       "title": "Total requests (by endpoint & status)",
-      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "gridPos": {"x": 0, "y": 0, "w": 8, "h": 6},
       "targets": [
         {
           "expr": "sum by (endpoint, status) (increase(api_requests_total[5m]))",
-          "legendFormat": "{{endpoint}} {{status}}",
-          "refId": "A"
+          "legendFormat": "{{endpoint}} {{status}}"
         }
       ]
     },
     {
       "type": "timeseries",
       "title": "Predict requests (rate) by status",
-      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "gridPos": {"x": 8, "y": 0, "w": 8, "h": 6},
       "targets": [
         {
           "expr": "sum by (status) (rate(predict_requests_total[1m]))",
-          "legendFormat": "{{status}}",
-          "refId": "A"
+          "legendFormat": "{{status}}"
         }
       ]
     },
     {
+      "type": "graph",
+      "title": "CPU usage (process)",
+      "targets": [
+        {
+          "expr": "rate(process_cpu_seconds_total[5m])",
+          "legendFormat": "process_cpu"
+        }
+      ],
+      "datasource": "Prometheus",
+      "gridPos": {"x": 16, "y": 0, "w": 8, "h": 6}
+    },
+    {
       "type": "timeseries",
       "title": "Latency p50/p95/p99 by endpoint",
-      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "gridPos": {"x": 0, "y": 6, "w": 8, "h": 6},
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum by (le, endpoint) (rate(request_latency_seconds_bucket[5m])))",
@@ -54,19 +64,40 @@
     },
     {
       "type": "timeseries",
-      "title": "Average latency (sum/count) by endpoint",
-      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "title": "Average latency by endpoint",
+      "gridPos": {"x": 8, "y": 6, "w": 8, "h": 6},
       "targets": [
         {
           "expr": "sum by (endpoint) (rate(request_latency_seconds_sum[5m])) / sum by (endpoint) (rate(request_latency_seconds_count[5m]))",
-          "legendFormat": "avg {{endpoint}}",
-          "refId": "A"
+          "legendFormat": "avg {{endpoint}}"
         }
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Predicted classes (rate)",
+      "gridPos": {"x": 16, "y": 6, "w": 8, "h": 6},
+      "targets": [
+        {
+          "expr": "sum by (predicted_class) (rate(predicted_class_total[1m]))",
+          "legendFormat": "{{predicted_class}}"
+        }
+      ]
+    },
+    {
+      "title": "Request Latency Heatmap (buckets)",
+      "type": "heatmap",
+      "targets": [
+        {
+          "expr": "sum(rate(request_latency_seconds_bucket[5m])) by (le)",
+          "legendFormat": "<= {{le}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 6 }
     }
   ],
   "templating": {"list": []},
   "annotations": {"list": []},
   "time": {"from": "now-1h", "to": "now"}
 }
-

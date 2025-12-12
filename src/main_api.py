@@ -30,6 +30,10 @@ request_counter = Counter(
 )
 predict_counter = Counter('predict_requests_total', 'Total /predict requests', ['status'])
 
+predicted_class_counter = Counter(
+    'predicted_class_total', 'Total predicted classes', ['predicted_class']
+)
+
 request_latency_histogram = Histogram(
     'request_latency_seconds', 'Request latency histogram in seconds', ['endpoint', 'method', 'status']
 )
@@ -262,6 +266,12 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
             out = [{"pred": int(p), "probs": pr} for p, pr in zip(preds, probs)]
             # increment a predict-specific counter (if available)
             predict_counter.labels(status='success').inc()
+            try:
+                for p in preds:
+                    predicted_class_counter.labels(predicted_class=str(int(p))).inc()
+            except Exception:
+                # metric increment should never break request handling
+                logging.exception("Failed to increment predicted_class_counter")
             return jsonify(out)
         except Exception as e:
             logging.error("Error during /predict: %s", e, exc_info=True)
