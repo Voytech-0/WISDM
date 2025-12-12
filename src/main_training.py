@@ -126,6 +126,7 @@ class LittleMLP(nn.Module):
 
     @staticmethod
     def _label_to_indices(y: torch.Tensor) -> torch.Tensor:
+        """Reversing one-hot encoding to class indices."""
         if y.dim() > 1 and y.size(1) > 1:
             return y.argmax(dim=1).long()
         return y.view(-1).long()
@@ -137,7 +138,7 @@ def make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1):
     val_n = int(n * val_split)
     test_n = int(n * test_split)
     train_n = n - val_n - test_n
-    if train_n <= 0:
+    if train_n <= 0 or val_n <= 0 or test_n <= 0:
         logging.error("Not enough samples for train/val/test splits: n=%s val_n=%s test_n=%s", n, val_n, test_n)
         raise ValueError("Not enough samples for splits")
     train_ds, val_ds, test_ds = random_split(ds, [train_n, val_n, test_n])

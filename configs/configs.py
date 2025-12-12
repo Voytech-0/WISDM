@@ -44,6 +44,7 @@ class DataConfig:
     db_read_chunk_size: int = 100000
     frequency: int = 20
     feature_length_in_seconds: int = 10
+    db_connect_timeout: int = 30
     data_path_prefix: str = "data/wisdm-dataset/raw"
     possible_devices: list[str] = ("phone", "watch")
     possible_sensors: list[str] = ("accel", "gyro")

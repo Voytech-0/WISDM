@@ -20,11 +20,6 @@ from preprocessing.preprocess import expand_raw_items_to_expanded_df
 from prometheus_flask_exporter import PrometheusMetrics
 from prometheus_client import Counter, Histogram
 
-# Module-level Prometheus metrics: created once when module is imported.
-# This prevents duplicate metric registration when create_app() is called multiple times
-# (e.g., during tests or when reloading the app). If you run Flask with multiple
-# worker processes (gunicorn), consider using the Prometheus Python client
-# multiprocess mode (set PROMETHEUS_MULTIPROC_DIR) or a Pushgateway.
 request_counter = Counter(
     'api_requests_total', 'Total API requests', ['endpoint', 'method', 'status']
 )
@@ -57,7 +52,7 @@ class ModelLoader:
 
     @staticmethod
     @cache
-    def _load_cached(checkpoint_path_str: str, mtime: Optional[float], model_cls):
+    def _load_cached(checkpoint_path_str: str, model_cls):
         """Class-scoped cached loader.
 
         This loader strictly expects the checkpoint format produced by `main_training.py`:
@@ -96,24 +91,11 @@ class ModelLoader:
         model.eval()
         return model
 
-    def validate(self):
-        if not self.checkpoint_path.exists():
-            logging.error("Checkpoint not found: %s", self.checkpoint_path)
-            # raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
-            return False
-        return True
-
-    def _get_checkpoint_mtime(self) -> Optional[float]:
-        try:
-            return float(self.checkpoint_path.stat().st_mtime)
-        except Exception:
-            return None
 
     def load(self, force_reload: bool = False) -> torch.nn.Module:
         """Load the model from checkpoint and return it in eval mode.
 
-        Uses a module-level functools.cache to memoize the loaded model. The cache key
-        embeds the checkpoint file mtime so updates to the file cause a fresh load.
+        Uses a module-level functools.cache to memoize the loaded model.
         Passing `force_reload=True` clears the cache before loading.
         """
         with self._lock:
@@ -126,10 +108,7 @@ class ModelLoader:
                     pass
 
             # ensure the checkpoint is present (raises FileNotFoundError if missing)
-            self.validate()
-            current_mtime = self._get_checkpoint_mtime()
-            # call the cached loader; when mtime changes the cache key differs
-            model = self._load_cached(str(self.checkpoint_path), current_mtime, self.model_cls)
+            model = self._load_cached(str(self.checkpoint_path), self.model_cls)
             return model
 
 
@@ -182,20 +161,15 @@ class InputPreparer:
 
         X_np = df_expanded.select(feature_cols).to_numpy()
 
-        # If the model saved expected input size in hparams, validate it matches the preprocessed features
-        try:
-            expected = None
-            if model is not None and hasattr(model, 'hparams'):
-                # model.hparams may be an argparse Namespace-like or dict-like object
-                if hasattr(model.hparams, 'input_size'):
-                    expected = int(model.hparams.input_size)
-            if expected is not None and X_np.shape[1] != expected:
-                raise ValueError(
-                    f"Preprocessed input has {X_np.shape[1]} features but model expects {expected} features. Ensure the incoming JSON can be converted to the same expanded feature layout used during training."
-                )
-        except Exception:
-            # If model hparams can't be introspected, continue but the caller should ensure proper shape
-            logging.debug("Could not validate feature vector against model.hparams; skipping strict check")
+        expected = None
+        if model is not None and hasattr(model, 'hparams'):
+            # model.hparams may be an argparse Namespace-like or dict-like object
+            if hasattr(model.hparams, 'input_size'):
+                expected = int(model.hparams.input_size)
+        if expected is not None and X_np.shape[1] != expected:
+            raise ValueError(
+                f"Preprocessed input has {X_np.shape[1]} features but model expects {expected} features. Ensure the incoming JSON can be converted to the same expanded feature layout used during training."
+            )
 
         return torch.from_numpy(X_np).float()
 
