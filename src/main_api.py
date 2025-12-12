@@ -53,18 +53,7 @@ class ModelLoader:
     @staticmethod
     @cache
     def _load_cached(checkpoint_path_str: str, model_cls):
-        """Class-scoped cached loader.
 
-        This loader strictly expects the checkpoint format produced by `main_training.py`:
-        {
-            'model_state_dict': <state_dict>,
-            'hparams': { 'input_size': ..., 'hidden_size': ..., 'num_layers': ..., 'num_classes': ..., 'lr': ... }
-        }
-
-        It will raise a RuntimeError with a helpful message if the file is missing required keys
-        or instantiation/loading fails. This keeps behavior deterministic and avoids masking
-        programming errors with broad exception handlers.
-        """
         # Load checkpoint file
         ckpt = torch.load(checkpoint_path_str, map_location='cpu')
 
@@ -182,9 +171,13 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
     app = Flask(__name__)
 
     # load model using checkpoint's saved hparams
-    model = model_loader.load()
+    try:
+        model = model_loader.load()
+        logging.info("Model loaded from checkpoint")
+    except Exception as e:
+        model = None
+        logging.warning("Failed to load model during app startup")
 
-    # Initialize Prometheus metrics (static imports at top of file)
     metrics = PrometheusMetrics(app)
 
 
@@ -230,6 +223,16 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
 
     @app.route("/predict", methods=["POST"])
     def predict():
+        nonlocal model
+        if model is None:
+            try:
+                nonlocal model
+                model = model_loader.load()
+                logging.info("Model loaded from checkpoint on /predict request")
+            except Exception as e:
+                logging.error("Model not loaded and failed to load on /predict: %s", e, exc_info=True)
+                return jsonify({"error": "Model not loaded"}), HTTPStatus.INTERNAL_SERVER_ERROR
+
         try:
             payload = request.get_json(force=True)
             x_tensor = preparer.prepare(payload, model=model)
