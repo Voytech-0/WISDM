@@ -19,7 +19,7 @@ import random
 import sys
 import time
 import requests
-
+import src.preprocessing.preprocess as preprocess
 
 def generate_series(length: int, base_freq: float = 1.0, noise_std: float = 0.05):
     """Generate a single axis time-series using a sum of sines plus Gaussian noise.
@@ -125,16 +125,11 @@ def main():
         # If requested, load local data via the preprocessing helpers instead of generating synthetic series
         local_rows = None
         if args.use_local:
-            try:
-                import src.preprocessing.preprocess as preprocess
-            except Exception as exc:
-                logging.exception("Failed to import preprocessing helpers: %s", exc)
-                sys.exit(2)
 
             lf = preprocess.load_raw_data_from_local()
             if lf is None:
                 logging.error("No local data found under DataConfig.data_path_prefix=%s", getattr(preprocess.DataConfig, 'data_path_prefix', None))
-                sys.exit(2)
+                return
 
             lf = preprocess.raw_data_into_xyz_series(lf)
             lf = preprocess.convert_data_to_10_seconds_intervals(lf)
@@ -143,7 +138,7 @@ def main():
                 local_rows = lf.collect().to_dicts()
             except Exception as exc:
                 logging.exception("Failed to collect/preprocess local rows: %s", exc)
-                sys.exit(2)
+                return
 
             if not local_rows:
                 logging.error("No rows produced by preprocessing of local data")
