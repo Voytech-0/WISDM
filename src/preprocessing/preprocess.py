@@ -186,7 +186,7 @@ def convert_data_to_fixed_length_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
 Z_SCORE = None
 
 
-def get_z_score() -> Optional[pl.LazyFrame]:
+def get_z_score() -> Optional[dict]:
     """
     Get the currently stored z-score normalization stats.
     Only run after apply_z_score_normalization with train=True has been called.
@@ -194,6 +194,31 @@ def get_z_score() -> Optional[pl.LazyFrame]:
     """
     global Z_SCORE
     return Z_SCORE
+
+
+def stats_from_z_score(z_score: Dict[tuple, Dict[str, float]], group_columns: List[str] = None) -> pl.LazyFrame:
+    """
+    Convert a z-score dictionary back into a Polars LazyFrame for joining.
+    Reverses the logic: key (tuple) -> group columns, value (dict) -> stat columns.
+    """
+    if group_columns is None:
+        group_columns = ['device', 'sensor']
+
+    data_rows = []
+
+    for keys, stat_values in z_score.items():
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        row = stat_values.copy()
+
+        for idx, col_name in enumerate(group_columns):
+            if idx < len(keys):
+                row[col_name] = keys[idx]
+
+        data_rows.append(row)
+
+    return pl.DataFrame(data_rows).lazy()
 
 def apply_z_score_normalization(lf: pl.LazyFrame, z_score: dict = None, group_columns=None) -> pl.LazyFrame:
     """
@@ -235,8 +260,8 @@ def apply_z_score_normalization(lf: pl.LazyFrame, z_score: dict = None, group_co
                 'z_std': row['z_std'],
             }
         logging.info("Computed z-score normalization stats for %d groups", len(z_score))
-
-    stats = pl.LazyFrame(z_score)
+    else:
+        stats = stats_from_z_score(z_score)
 
     global Z_SCORE
     Z_SCORE = z_score

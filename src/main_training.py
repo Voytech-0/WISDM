@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 import polars as pl
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Any
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 
@@ -20,7 +20,6 @@ seed_val = TrainingConfig.seed
 torch.manual_seed(seed_val)
 np.random.seed(seed_val)
 random.seed(seed_val)
-
 
 
 class SequenceDataset(Dataset):
@@ -124,6 +123,7 @@ def make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1):
     test_loader = DataLoader(test_ds, batch_size=batch_size)
     return train_loader, val_loader, test_loader
 
+
 @step
 def run_training(
         epochs: int = TrainingConfig.max_epochs,
@@ -131,20 +131,43 @@ def run_training(
         lr: float = TrainingConfig.lr
 ) -> Tuple[
     Annotated[nn.Module, "trained_model"],
-    Annotated[List[Dict], "z_score_stats"]
+    Annotated[List[Dict[str, Any]], "z_score_stats"]
 ]:
     """
     Run training and return the model and stats as ZenML artifacts.
     """
     logging.info("Running training with epochs=%d, batch_size=%d, lr=%.6f", epochs, batch_size, lr)
+
+    # Run preprocessing (which populates the global Z_SCORE variable)
     data = preprocessing_pipeline_for_wisdm_raw_data()
 
-    stats_dict = []
-    try:
-        stats_lf = get_z_score()
-        stats_dict = stats_lf.collect().to_dicts()
-    except Exception as e:
-        logging.warning("Failed to load or save z-score stats: %s", e)
+    # Retrieve the dictionary (Keys are tuples: (device, sensor))
+    raw_stats_dict = get_z_score()
+
+    # Flatten the dictionary into a list of dicts for safe serialization (handling tuple keys)
+    serializable_stats: List[Dict[str, Any]] = []
+
+    if raw_stats_dict:
+        try:
+            for key_tuple, stats in raw_stats_dict.items():
+                # We assume key_tuple matches ['device', 'sensor'] based on preprocess logic
+                if isinstance(key_tuple, tuple) and len(key_tuple) >= 2:
+                    device, sensor = key_tuple[0], key_tuple[1]
+                else:
+                    # Fallback if single string key or unexpected structure
+                    device, sensor = str(key_tuple), "unknown"
+
+                record = {
+                    "device": device,
+                    "sensor": sensor,
+                    **stats
+                }
+                serializable_stats.append(record)
+            logging.info("Serialized z-score stats for %d groups.", len(serializable_stats))
+        except Exception as e:
+            logging.error("Failed to serialize z-score stats: %s", e)
+    else:
+        logging.warning("No z-score stats found after preprocessing.")
 
     train_loader, val_loader, _ = make_dataloaders(data, batch_size)
     input_size = data.width - len([col for col in data.columns if col.startswith("label")])
@@ -189,13 +212,13 @@ def run_training(
 
         logging.info(f"Epoch {epoch}/{epochs} train_loss={train_loss_avg:.4f} val_loss={val_loss_avg:.4f}")
 
-
         if val_loss_avg < best_val_loss:
             best_val_loss = val_loss_avg
 
     model.to('cpu')
+    logging.info("Training completed. Best val_loss=%.4f", best_val_loss)
 
-    return model, stats_dict
+    return model, serializable_stats
 
 
 @pipeline

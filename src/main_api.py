@@ -26,6 +26,7 @@ import atexit
 
 logging.basicConfig(level=logging.INFO)
 
+
 class _MetricsFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -35,6 +36,7 @@ class _MetricsFilter(logging.Filter):
         except Exception:
             return True
         return True
+
 
 logging.getLogger('werkzeug').addFilter(_MetricsFilter())
 
@@ -66,7 +68,7 @@ class ModelLoader:
     def load(self, force_reload: bool = False) -> Tuple[nn.Module, List[Dict]]:
         """
         Connects to ZenML, finds the last successful run, and loads the artifacts.
-        Returns: (model, z_score_stats)
+        Returns: (model, z_score_stats_list)
         """
         with self._lock:
             if self._cached_model is not None and self._cached_stats is not None and not force_reload:
@@ -88,16 +90,56 @@ class ModelLoader:
 
                 if "trained_model" not in step_outputs:
                     raise KeyError("Artifact 'trained_model' not found in step outputs.")
-                self._cached_model = step_outputs["trained_model"].load()
-                self._cached_model.eval()
 
-                if "z_score_stats" in step_outputs:
-                    self._cached_stats = step_outputs["z_score_stats"].load()
+                # The pipeline may return a list of artifacts or a single artifact.
+                trained_artifact = step_outputs["trained_model"]
+                if isinstance(trained_artifact, list):
+                    trained_artifact = trained_artifact[0]
+
+                try:
+                    if hasattr(trained_artifact, "load") and callable(getattr(trained_artifact, "load")):
+                        self._cached_model = trained_artifact.load()
+                    else:
+                        self._cached_model = trained_artifact
+                except Exception as e:
+                    logging.error(f"Failed to load trained_model artifact: {e}")
+                    raise
+
+                if hasattr(self._cached_model, "eval") and callable(getattr(self._cached_model, "eval")):
+                    try:
+                        self._cached_model.eval()
+                    except Exception:
+                        logging.warning("Calling eval() on the loaded model failed, continuing.")
+
+                # Load z_score_stats (Expected: List[Dict])
+                if "z_score_stats" in step_outputs and step_outputs["z_score_stats"] is not None:
+                    stats_artifact = step_outputs["z_score_stats"]
+
+                    if isinstance(stats_artifact, list):
+                        # ZenML sometimes wraps single artifacts in a list if multiple outputs
+                        # But our artifact itself is a List. We need to be careful.
+                        # If the artifact object itself is a list, we take index 0.
+                        if len(stats_artifact) > 0 and hasattr(stats_artifact[0], 'load'):
+                            stats_artifact = stats_artifact[0]
+
+                    try:
+                        if hasattr(stats_artifact, "load") and callable(getattr(stats_artifact, "load")):
+                            self._cached_stats = stats_artifact.load()
+                        else:
+                            self._cached_stats = stats_artifact
+                    except Exception as e:
+                        logging.warning(f"Failed to load z_score_stats artifact: {e}. Defaulting to empty list.")
+                        self._cached_stats = []
                 else:
                     logging.warning("Artifact 'z_score_stats' not found. Defaulting to empty list.")
                     self._cached_stats = []
 
-                logging.info("Successfully loaded model and stats from ZenML.")
+                # Ensure it's a list (ZenML/Pandas/Numpy conversion safety)
+                if not isinstance(self._cached_stats, list):
+                    logging.warning(f"Loaded stats is type {type(self._cached_stats)}, expected list. Resetting.")
+                    self._cached_stats = []
+
+                logging.info(f"Successfully loaded model and stats ({len(self._cached_stats)} records) from ZenML.")
                 return self._cached_model, self._cached_stats
 
             except DoesNotExistException:
@@ -110,15 +152,34 @@ class ModelLoader:
 
 class InputPreparer:
     """
-    Prepare input tensors. 
-    Stores z_score_stats to apply normalization if needed.
+    Prepare input tensors.
+    Stores z_score_stats (List[Dict]) and converts them to the Dict[Tuple, Dict]
+    format required by the preprocessing pipeline.
     """
 
     def __init__(self, z_score_stats: List[Dict] = None):
-        self.z_score_stats = z_score_stats or []
+        self._set_stats_internal(z_score_stats)
 
     def set_stats(self, z_score_stats: List[Dict]):
-        self.z_score_stats = z_score_stats or []
+        self._set_stats_internal(z_score_stats)
+
+    def _set_stats_internal(self, stats_list: List[Dict]):
+        """
+        Convert the flattened List[Dict] back into the Dict[Tuple, Dict] format
+        required by 'preprocess.apply_z_score_normalization'.
+        """
+        stats_list = stats_list or []
+        self.z_score_dict = {}
+
+        for item in stats_list:
+            # We assume the keys are 'device' and 'sensor' based on training logic
+            if 'device' in item and 'sensor' in item:
+                key = (item['device'], item['sensor'])
+                # value is everything else
+                stats_vals = {k: v for k, v in item.items() if k not in ['device', 'sensor']}
+                self.z_score_dict[key] = stats_vals
+
+        logging.info(f"InputPreparer updated with {len(self.z_score_dict)} normalization groups.")
 
     @staticmethod
     def _is_raw(obj: dict) -> bool:
@@ -134,7 +195,8 @@ class InputPreparer:
             raise ValueError("Empty input payload")
 
         if all(self._is_raw(it) for it in items):
-            df_expanded = expand_raw_items_to_expanded_df(items, z_score=self.z_score_stats)
+            # Pass the RECONSTRUCTED dictionary to the preprocess function
+            df_expanded = expand_raw_items_to_expanded_df(items, z_score=self.z_score_dict)
         else:
             # Fallback for pre-expanded data
             if not all(isinstance(it, dict) for it in items):
@@ -280,6 +342,7 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
         """
         Triggers the ZenML training pipeline in a background thread.
         """
+
         def run_pipeline_task():
             try:
                 logging.info("Starting training pipeline via API trigger...")
@@ -302,6 +365,7 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
         """the same `scheduled_job` function used by the APScheduler but run
         it in a background thread so the HTTP request returns quickly.
         """
+
         def run_task():
             try:
                 logging.info("Manual trigger: starting daily maintenance pipeline via API...")
