@@ -2,24 +2,14 @@ from pathlib import Path
 import sys
 from typing import List, Dict, Any, Optional
 
-import numpy as np
 import polars as pl
 from sqlalchemy import create_engine, text
 import time
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
-import pickle
 import logging
+from configs.configs import DataConfig, MySQLConfig
 
 logging.basicConfig(level=logging.INFO)
-
-
-# When tests import this file directly, the repo root may not be on sys.path.
-# Prepend the repository root so `configs.configs` can be resolved.
-repo_root = Path(__file__).resolve().parents[2]
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
-from configs.configs import DataConfig, PathsConfig, MySQLConfig
 
 
 def wait_for_mysql(engine, timeout: int = 30, interval: float = 1.0):
@@ -27,7 +17,6 @@ def wait_for_mysql(engine, timeout: int = 30, interval: float = 1.0):
     """
     start = time.time()
     attempt = 0
-    last_exc = None
     while True:
         attempt += 1
         try:
@@ -37,7 +26,6 @@ def wait_for_mysql(engine, timeout: int = 30, interval: float = 1.0):
             logging.info("MySQL available after %d attempt(s)", attempt)
             return
         except (OperationalError, SQLAlchemyError) as exc:
-            last_exc = exc
             elapsed = time.time() - start
             if elapsed >= timeout:
                 logging.error("Timed out after %.1fs waiting for MySQL (attempts=%d)", elapsed, attempt)
@@ -247,8 +235,8 @@ def apply_z_score_normalization(lf: pl.LazyFrame, z_score: dict = None, group_co
                 'z_std': row['z_std'],
             }
         logging.info("Computed z-score normalization stats for %d groups", len(z_score))
-    else:
-        stats = pl.LazyFrame(z_score)
+
+    stats = pl.LazyFrame(z_score)
 
     global Z_SCORE
     Z_SCORE = z_score
@@ -328,8 +316,6 @@ def preprocessing_pipeline_for_wisdm_raw_data():
     lf = raw_data_into_xyz_series(lf)
     lf = convert_data_to_fixed_length_intervals(lf)
     lf = apply_z_score_normalization(lf)
-    # lf = one_hot_encode(lf, ["device", "sensor", "label"])
-    # DataFrame from LazyFrame
     df = collect_and_dummify_drop_subject(lf)
     df = expand_lists(df, ["x", "y", "z"])
     logging.info("Preprocessing produced DataFrame with %d rows and %d columns", df.height, len(df.columns))
@@ -347,7 +333,6 @@ def build_raw_lazyframe_from_items(items: List[Dict[str, Any]]) -> pl.LazyFrame:
         sensor = it.get('sensor') or None
         subject_id = it.get('subject_id') or 'unknown'
         label = it.get('label') if 'label' in it else None
-        # coerce numeric values - allow callers to raise if conversion fails
         x = list(map(float, it['x']))
         y = list(map(float, it['y']))
         z = list(map(float, it['z']))
@@ -364,14 +349,11 @@ def lazyframe_to_single_10s(lf: pl.LazyFrame) -> pl.LazyFrame:
     if lf is None:
         raise ValueError("Input LazyFrame cannot be None")
 
-    # Ensure required columns exist
     names = set(lf.collect_schema().names())
     required = {'x', 'y', 'z'}
     if not required.issubset(names):
         raise AssertionError(f"LazyFrame must contain columns {required}, got {names}")
 
-    # Pad/truncate lists to the desired length. We use concat_list + slice so we can
-    # pad with zeros (matching test expectations) and avoid `.list.to_array` width errors.
     pad_x = [0] * desired_length
     pad_y = [0.0] * desired_length
     pad_z = [0.0] * desired_length

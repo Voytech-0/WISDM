@@ -11,7 +11,6 @@ from flask import request, jsonify, Flask, g
 from torch import nn
 import polars as pl
 
-# ZenML Imports
 from zenml.client import Client
 from zenml.exceptions import DoesNotExistException
 
@@ -25,24 +24,20 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import atexit
 
-# Logging Setup
 logging.basicConfig(level=logging.INFO)
 
 class _MetricsFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
-            # Common werkzeug access log format includes the request line like: "GET /metrics HTTP/1.1"
             if '"GET /metrics' in msg or '"POST /metrics' in msg or ' /metrics ' in msg:
                 return False
         except Exception:
-            # Don't accidentally drop unrelated logs on error
             return True
         return True
 
 logging.getLogger('werkzeug').addFilter(_MetricsFilter())
 
-# Metrics
 request_counter = Counter(
     'api_requests_total', 'Total API requests', ['endpoint', 'method', 'status']
 )
@@ -65,7 +60,6 @@ class ModelLoader:
         self.step_name = step_name
         self._lock = threading.RLock()
 
-        # Cache to hold the loaded artifacts in memory
         self._cached_model: Optional[nn.Module] = None
         self._cached_stats: Optional[List[Dict]] = None
 
@@ -210,7 +204,6 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
         """Function to be run by the scheduler."""
         logging.info("Scheduler waking up.")
         try:
-            # Run the ZenML pipeline directly
             logging.info("Running daily maintenance pipeline...")
             daily_maintenance_pipeline()
             logging.info("Daily Pipeline finished successfully.")

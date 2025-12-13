@@ -1,5 +1,4 @@
 import logging
-from pathlib import Path
 import random
 import numpy as np
 import torch
@@ -7,7 +6,6 @@ import polars as pl
 from typing import Tuple, Dict, List
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
-import json
 
 from zenml import step, pipeline
 from typing_extensions import Annotated
@@ -27,7 +25,7 @@ random.seed(seed_val)
 
 class SequenceDataset(Dataset):
     """
-    A PyTorch Dataset class that takes either a path to a CSV or a Polars DataFrame,
+    A PyTorch Dataset class that takes Polars DataFrame,
     splits it into features (X) and labels (y), and converts all data to torch tensors.
 
     Features are all columns *not* starting with "label".
@@ -35,13 +33,6 @@ class SequenceDataset(Dataset):
     """
 
     def __init__(self, df: pl.DataFrame):
-        """
-        Initializes the dataset by splitting the DataFrame and converting to tensors.
-
-        Args:
-            df: Polars DataFrame
-        """
-
         label_cols = [col for col in df.columns if col.startswith("label")]
         feature_cols = [col for col in df.columns if col not in label_cols]
 
@@ -63,23 +54,15 @@ class SequenceDataset(Dataset):
         logging.debug(f"y shape: {self.y.shape}")
 
     def __len__(self) -> int:
-        """
-        Returns the total number of samples in the dataset.
-        """
         return self.X.shape[0]
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Retrieves one sample (feature-label pair) from the dataset.
-        """
-        # Return the X and y tensors for the given index
         return self.X[idx], self.y[idx]
 
 
 class LittleMLP(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, num_classes, lr):
         super().__init__()
-        # save hyperparams for later introspection
         self.hparams = {
             'input_size': int(input_size),
             'hidden_size': int(hidden_size),
