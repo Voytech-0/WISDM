@@ -1,4 +1,3 @@
-# ensure the project root is on sys.path so `import src...` works when pytest runs
 import sys
 from pathlib import Path
 
@@ -38,11 +37,11 @@ class StubLoader:
 
     def __init__(self, model: DummyModel, stats=None):
         self._model = model
-        self.z_score_stats = stats or []
+        self.z_score_dict = stats or []
 
     def load(self, force_reload: bool = False):
         # The new interface returns a tuple
-        return self._model, self.z_score_stats
+        return self._model, self.z_score_dict
 
 
 def test_create_app_request_timing():
@@ -173,7 +172,7 @@ def test_modelLoader_load_success(MockClient):
     # Keys must match what is in main_api.py (run_training step)
     mock_run.steps.__getitem__.return_value.outputs = {
         "trained_model": mock_model_artifact,
-        "z_score_stats": mock_stats_artifact
+        "z_score_dict": mock_stats_artifact
     }
 
     # 2. Execute
@@ -207,7 +206,7 @@ def test_modelLoader_load_caching(MockClient):
     mock_model_artifact.load.return_value = DummyModel()
     mock_run.steps.__getitem__.return_value.outputs = {
         "trained_model": mock_model_artifact,
-        "z_score_stats": MagicMock()  # stats
+        "z_score_dict": MagicMock()  # stats
     }
 
     loader = ModelLoader()
@@ -229,11 +228,14 @@ def test_modelLoader_load_caching(MockClient):
 def test_input_preparer_stats():
     """Test that InputPreparer can hold and update stats."""
     prep = InputPreparer()
-    assert prep.z_score_stats == []
+    assert prep.z_score_dict == {}
 
-    new_stats = [{"col": "x", "mean": 10}]
+    new_stats = [
+        {"device": "dev1", "sensor": "acc", "col": "x", "mean": 10}
+    ]
     prep.set_stats(new_stats)
-    assert prep.z_score_stats == new_stats
+    expected = {("dev1", "acc"): {"col": "x", "mean": 10}}
+    assert prep.z_score_dict == expected
 
 
 def test_input_preparer_prepare():

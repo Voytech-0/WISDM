@@ -1,37 +1,26 @@
-import pickle
 import numpy as np
 import pandas as pd
 import polars as pl
 import pytest
-from statistics import stdev
 from pathlib import Path
+import time
 
 import preprocessing.preprocess as preprocess
-from configs.configs import DataConfig, PathsConfig
+from configs.configs import DataConfig
 from preprocessing.preprocess import (
     load_raw_data_from_local,
     raw_data_into_xyz_series,
     convert_data_to_fixed_length_intervals,
     apply_z_score_normalization,
     lazyframe_to_single_10s,
-    collect_and_dummify_drop_subject,
     expand_lists,
     expand_raw_items_to_expanded_df,
 )
 
 
 def test_wait_for_mysql(monkeypatch):
-    """
-    Test wait_for_mysql with a mocked engine and connection.
-    Cases:
-    1. Immediate success.
-    2. Success after failure (retries).
-    3. Timeout failure.
-    """
     from sqlalchemy.exc import OperationalError
-    import time
 
-    # Mock Engine and Connection
     class MockConnection:
         def __init__(self, succeed_on_attempt=1):
             self.attempt = 0
@@ -56,28 +45,20 @@ def test_wait_for_mysql(monkeypatch):
         def connect(self):
             return self.conn
 
-    # Case 1: Immediate Success
     engine_success = MockEngine(succeed_on_attempt=1)
     preprocess.wait_for_mysql(engine_success, timeout=5, interval=0.1)
 
-    # Case 2: Success after 2 failures (succeeds on 3rd)
     engine_retry = MockEngine(succeed_on_attempt=3)
     start_time = time.time()
     preprocess.wait_for_mysql(engine_retry, timeout=5, interval=0.1)
-    # Ensure it actually waited (approx 0.1s + 0.2s = 0.3s)
     assert time.time() - start_time >= 0.2
 
-    # Case 3: Timeout
     engine_fail = MockEngine(succeed_on_attempt=99)
     with pytest.raises(OperationalError):
         preprocess.wait_for_mysql(engine_fail, timeout=0.5, interval=0.1)
 
 
 def test_load_raw_data_from_mysql(monkeypatch):
-    """
-    Test loading data from MySQL using mocked SQLAlchemy engine/connection.
-    """
-    # 1. Mock Configs
     monkeypatch.setattr(preprocess.MySQLConfig, "user", "test_user")
     monkeypatch.setattr(preprocess.MySQLConfig, "host", "localhost")
     monkeypatch.setattr(preprocess.MySQLConfig, "port", 3306)
@@ -89,7 +70,7 @@ def test_load_raw_data_from_mysql(monkeypatch):
         def __init__(self, data, columns):
             self.data = data
             self.keys_val = columns
-            self.iter_data = iter([data[i:i + 2] for i in range(0, len(data), 2)])  # chunk size 2
+            self.iter_data = iter([data[i:i + 2] for i in range(0, len(data), 2)])
 
         def keys(self):
             return self.keys_val
@@ -138,9 +119,6 @@ def test_load_raw_data_from_mysql(monkeypatch):
 
 
 def test_load_raw_data_from_local(tmp_path, monkeypatch):
-    """
-    Tests loading from disk separately from processing.
-    """
     phone_dir = tmp_path / "phone" / "accel"
     phone_dir.mkdir(parents=True)
 
@@ -160,10 +138,6 @@ def test_load_raw_data_from_local(tmp_path, monkeypatch):
 
 
 def test_raw_data_into_xyz_series():
-    """
-    Test aggregation of raw rows into lists grouped by subject/device/sensor/label.
-    Input must be a LazyFrame.
-    """
     cases = [
         {
             "name": "basic_aggregation",
@@ -218,7 +192,7 @@ def test_raw_data_into_xyz_series():
                 assert actual_vals == expected_vals
 
 
-def test_convert_data_to_10_seconds_intervals(monkeypatch):
+def test_convert_data_to_fixed_length_intervals(monkeypatch):
     monkeypatch.setattr(DataConfig, "feature_length_in_seconds", 10)
     monkeypatch.setattr(DataConfig, "frequency", 1)
 
@@ -257,10 +231,7 @@ def test_convert_data_to_10_seconds_intervals(monkeypatch):
         )
 
 
-def test_apply_z_score_normalization(monkeypatch, tmp_path):
-    stats_path = tmp_path / "z_score_stats.pkl"
-    monkeypatch.setattr(PathsConfig, "z_score_params_path", str(stats_path))
-
+def test_apply_z_score_normalization():
     input_lf = pl.LazyFrame({
         "subject_id": ["1", "2"],
         "device": ["devA", "devB"],
@@ -271,49 +242,46 @@ def test_apply_z_score_normalization(monkeypatch, tmp_path):
         "z": [[2.0, 2.0, 2.0], [6.0, 6.0, 6.0]],
     })
 
-    cases = [
-        {
-            "mode": "train",
-            "train_flag": True,
-            "input": input_lf,
-            "expected_x_first_vals": [-1.0, 0.0, 1.0],
-            "check_file_exists": True
-        },
-        {
-            "mode": "inference",
-            "train_flag": False,
-            "input": pl.LazyFrame({
-                "subject_id": ["3"],
-                "device": ["devA"],
-                "sensor": ["sens1"],
-                "label": ["L"],
-                "x": [[10.0, 10.0, 10.0]],
-                "y": [[1.0, 1.0, 1.0]],
-                "z": [[2.0, 2.0, 2.0]]
-            }),
-            "expected_x_first_vals": [0.0, 0.0, 0.0],
-            "check_file_exists": True
-        }
-    ]
-
-    # Run TRAIN case first to generate the file
-    train_case = cases[0]
-    out_train = apply_z_score_normalization(train_case["input"], train=True)
+    # Case 1: Compute stats (simulate Training)
+    # devA: x mean 10, std 10. devB: x mean 100, std 0.
+    out_train = apply_z_score_normalization(input_lf, z_score=None)
     df_train = out_train.collect()
 
-    assert stats_path.exists()
+    stats = preprocess.get_z_score()
+    assert stats is not None
+    assert ('devA', 'sens1') in stats
+    assert stats[('devA', 'sens1')]['x_mean'] == 10.0
 
-    # Verify Train output (DevA is row 0)
+    # Check Normalization
+    # devA row 0 x: (0-10)/10 = -1
     row_0_x = df_train.filter(pl.col("device") == "devA").get_column("x")[0]
-    np.testing.assert_allclose(row_0_x, train_case["expected_x_first_vals"])
+    np.testing.assert_allclose(row_0_x, [-1.0, 0.0, 1.0])
 
-    # Run INFERENCE case
-    infer_case = cases[1]
-    out_infer = apply_z_score_normalization(infer_case["input"], train=False)
+    # Case 2: Apply specific stats (simulate Inference)
+    # Force mean 0, std 1 for devA
+    fake_stats = {
+        ('devA', 'sens1'): {
+            'x_mean': 0.0, 'y_mean': 0.0, 'z_mean': 0.0,
+            'x_std': 1.0, 'y_std': 1.0, 'z_std': 1.0
+        }
+    }
+
+    input_infer = pl.LazyFrame({
+        "subject_id": ["3"],
+        "device": ["devA"],
+        "sensor": ["sens1"],
+        "label": ["L"],
+        "x": [[10.0, 10.0, 10.0]],
+        "y": [[1.0, 1.0, 1.0]],
+        "z": [[2.0, 2.0, 2.0]]
+    })
+
+    out_infer = apply_z_score_normalization(input_infer, z_score=fake_stats)
     df_infer = out_infer.collect()
 
+    # (10 - 0) / 1 = 10
     row_infer_x = df_infer.get_column("x")[0]
-    np.testing.assert_allclose(row_infer_x, infer_case["expected_x_first_vals"])
+    np.testing.assert_allclose(row_infer_x, [10.0, 10.0, 10.0])
 
 
 def test_expand_lists(monkeypatch):
@@ -367,15 +335,13 @@ def test_lazyframe_to_single_10s(monkeypatch):
             assert x_list[-1] == case["expected_x_last"]
 
 
-def test_expand_raw_items_to_expanded_df(monkeypatch, tmp_path):
-
-    monkeypatch.setattr(PathsConfig, "z_score_params_path", str(tmp_path / "stats.pkl"))
-    stats_df = pl.DataFrame({
-        "device": ["phone"], "sensor": ["accel"],
-        "x_mean": [0.0], "y_mean": [0.0], "z_mean": [0.0],
-        "x_std": [1.0], "y_std": [1.0], "z_std": [1.0],
-    })
-    set_z_score_stats(stats_df.lazy())
+def test_expand_raw_items_to_expanded_df(monkeypatch):
+    z_score_stats = {
+        ("phone", "accel"): {
+            "x_mean": 0.0, "y_mean": 0.0, "z_mean": 0.0,
+            "x_std": 1.0, "y_std": 1.0, "z_std": 1.0,
+        }
+    }
 
     monkeypatch.setattr(DataConfig, "feature_length_in_seconds", 2)
     monkeypatch.setattr(DataConfig, "frequency", 1)
@@ -390,7 +356,7 @@ def test_expand_raw_items_to_expanded_df(monkeypatch, tmp_path):
         "device": "phone", "sensor": "accel"
     }]
 
-    df_out = expand_raw_items_to_expanded_df(items)
+    df_out = expand_raw_items_to_expanded_df(items, z_score=z_score_stats)
 
     assert df_out.height == 1
     assert "x_0" in df_out.columns

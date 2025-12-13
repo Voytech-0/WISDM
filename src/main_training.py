@@ -131,31 +131,20 @@ def run_training(
         lr: float = TrainingConfig.lr
 ) -> Tuple[
     Annotated[nn.Module, "trained_model"],
-    Annotated[List[Dict[str, Any]], "z_score_stats"]
+    Annotated[List[Dict[str, Any]], "z_score_dict"]
 ]:
-    """
-    Run training and return the model and stats as ZenML artifacts.
-    """
     logging.info("Running training with epochs=%d, batch_size=%d, lr=%.6f", epochs, batch_size, lr)
 
-    # Run preprocessing (which populates the global Z_SCORE variable)
     data = preprocessing_pipeline_for_wisdm_raw_data()
 
-    # Retrieve the dictionary (Keys are tuples: (device, sensor))
     raw_stats_dict = get_z_score()
 
-    # Flatten the dictionary into a list of dicts for safe serialization (handling tuple keys)
     serializable_stats: List[Dict[str, Any]] = []
 
     if raw_stats_dict:
         try:
             for key_tuple, stats in raw_stats_dict.items():
-                # We assume key_tuple matches ['device', 'sensor'] based on preprocess logic
-                if isinstance(key_tuple, tuple) and len(key_tuple) >= 2:
-                    device, sensor = key_tuple[0], key_tuple[1]
-                else:
-                    # Fallback if single string key or unexpected structure
-                    device, sensor = str(key_tuple), "unknown"
+                device, sensor = key_tuple[0], key_tuple[1]
 
                 record = {
                     "device": device,

@@ -47,12 +47,12 @@ def mock_zenml_client(real_model_instance):
 
     mock_step_outputs = {
         "trained_model": MagicMock(),
-        "z_score_stats": MagicMock()
+        "z_score_dict": MagicMock()
     }
 
     mock_step_outputs["trained_model"].load.return_value = real_model_instance
 
-    mock_step_outputs["z_score_stats"].load.return_value = [
+    mock_step_outputs["z_score_dict"].load.return_value = [
         {
             "device": "device_1",
             "sensor": "accel",

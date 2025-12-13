@@ -66,10 +66,7 @@ class ModelLoader:
         self._cached_stats: Optional[List[Dict]] = None
 
     def load(self, force_reload: bool = False) -> Tuple[nn.Module, List[Dict]]:
-        """
-        Connects to ZenML, finds the last successful run, and loads the artifacts.
-        Returns: (model, z_score_stats_list)
-        """
+
         with self._lock:
             if self._cached_model is not None and self._cached_stats is not None and not force_reload:
                 return self._cached_model, self._cached_stats
@@ -91,7 +88,6 @@ class ModelLoader:
                 if "trained_model" not in step_outputs:
                     raise KeyError("Artifact 'trained_model' not found in step outputs.")
 
-                # The pipeline may return a list of artifacts or a single artifact.
                 trained_artifact = step_outputs["trained_model"]
                 if isinstance(trained_artifact, list):
                     trained_artifact = trained_artifact[0]
@@ -111,14 +107,10 @@ class ModelLoader:
                     except Exception:
                         logging.warning("Calling eval() on the loaded model failed, continuing.")
 
-                # Load z_score_stats (Expected: List[Dict])
-                if "z_score_stats" in step_outputs and step_outputs["z_score_stats"] is not None:
-                    stats_artifact = step_outputs["z_score_stats"]
+                if "z_score_dict" in step_outputs and step_outputs["z_score_dict"] is not None:
+                    stats_artifact = step_outputs["z_score_dict"]
 
                     if isinstance(stats_artifact, list):
-                        # ZenML sometimes wraps single artifacts in a list if multiple outputs
-                        # But our artifact itself is a List. We need to be careful.
-                        # If the artifact object itself is a list, we take index 0.
                         if len(stats_artifact) > 0 and hasattr(stats_artifact[0], 'load'):
                             stats_artifact = stats_artifact[0]
 
@@ -128,13 +120,12 @@ class ModelLoader:
                         else:
                             self._cached_stats = stats_artifact
                     except Exception as e:
-                        logging.warning(f"Failed to load z_score_stats artifact: {e}. Defaulting to empty list.")
+                        logging.warning(f"Failed to load z_score_dict artifact: {e}. Defaulting to empty list.")
                         self._cached_stats = []
                 else:
-                    logging.warning("Artifact 'z_score_stats' not found. Defaulting to empty list.")
+                    logging.warning("Artifact 'z_score_dict' not found. Defaulting to empty list.")
                     self._cached_stats = []
 
-                # Ensure it's a list (ZenML/Pandas/Numpy conversion safety)
                 if not isinstance(self._cached_stats, list):
                     logging.warning(f"Loaded stats is type {type(self._cached_stats)}, expected list. Resetting.")
                     self._cached_stats = []
@@ -153,15 +144,15 @@ class ModelLoader:
 class InputPreparer:
     """
     Prepare input tensors.
-    Stores z_score_stats (List[Dict]) and converts them to the Dict[Tuple, Dict]
+    Stores z_score_dict (List[Dict]) and converts them to the Dict[Tuple, Dict]
     format required by the preprocessing pipeline.
     """
 
-    def __init__(self, z_score_stats: List[Dict] = None):
-        self._set_stats_internal(z_score_stats)
+    def __init__(self, z_score_dict: List[Dict] = None):
+        self._set_stats_internal(z_score_dict)
 
-    def set_stats(self, z_score_stats: List[Dict]):
-        self._set_stats_internal(z_score_stats)
+    def set_stats(self, z_score_dict: List[Dict]):
+        self._set_stats_internal(z_score_dict)
 
     def _set_stats_internal(self, stats_list: List[Dict]):
         """
@@ -172,10 +163,8 @@ class InputPreparer:
         self.z_score_dict = {}
 
         for item in stats_list:
-            # We assume the keys are 'device' and 'sensor' based on training logic
             if 'device' in item and 'sensor' in item:
                 key = (item['device'], item['sensor'])
-                # value is everything else
                 stats_vals = {k: v for k, v in item.items() if k not in ['device', 'sensor']}
                 self.z_score_dict[key] = stats_vals
 
@@ -195,10 +184,8 @@ class InputPreparer:
             raise ValueError("Empty input payload")
 
         if all(self._is_raw(it) for it in items):
-            # Pass the RECONSTRUCTED dictionary to the preprocess function
             df_expanded = expand_raw_items_to_expanded_df(items, z_score=self.z_score_dict)
         else:
-            # Fallback for pre-expanded data
             if not all(isinstance(it, dict) for it in items):
                 raise ValueError("Each input must be an object with feature keys or x/y/z lists")
             df_expanded = pl.DataFrame(items)
@@ -362,9 +349,6 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
     @app.route("/run_daily")
     @metrics.do_not_track()
     def run_daily_pipeline():
-        """the same `scheduled_job` function used by the APScheduler but run
-        it in a background thread so the HTTP request returns quickly.
-        """
 
         def run_task():
             try:
