@@ -28,6 +28,20 @@ import atexit
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
 
+class _MetricsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            # Common werkzeug access log format includes the request line like: "GET /metrics HTTP/1.1"
+            if '"GET /metrics' in msg or '"POST /metrics' in msg or ' /metrics ' in msg:
+                return False
+        except Exception:
+            # Don't accidentally drop unrelated logs on error
+            return True
+        return True
+
+logging.getLogger('werkzeug').addFilter(_MetricsFilter())
+
 # Metrics
 request_counter = Counter(
     'api_requests_total', 'Total API requests', ['endpoint', 'method', 'status']
@@ -175,12 +189,14 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
 
     @app.before_request
     def before_request_timing():
-        if request.path == "/metrics": return
+        if request.path == "/metrics":
+            return
         g.request_start_time = perf_counter()
 
     @app.after_request
     def after_request_timing(response):
-        if request.path == "/metrics": return response
+        if request.path == "/metrics":
+            return response
         start = getattr(g, 'request_start_time', None)
         if start:
             elapsed = perf_counter() - start
@@ -195,6 +211,7 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
         logging.info("Scheduler waking up.")
         try:
             # Run the ZenML pipeline directly
+            logging.info("Running daily maintenance pipeline...")
             daily_maintenance_pipeline()
             logging.info("Daily Pipeline finished successfully.")
         except Exception as e:

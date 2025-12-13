@@ -141,7 +141,7 @@ def make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1):
     test_loader = DataLoader(test_ds, batch_size=batch_size)
     return train_loader, val_loader, test_loader
 
-
+@step
 def run_training(
         epochs: int = TrainingConfig.max_epochs,
         batch_size: int = TrainingConfig.batch_size,
@@ -153,7 +153,7 @@ def run_training(
     """
     Run training and return the model and stats as ZenML artifacts.
     """
-
+    logging.info("Running training with epochs=%d, batch_size=%d, lr=%.6f", epochs, batch_size, lr)
     data = preprocessing_pipeline_for_wisdm_raw_data()
 
     stats_dict = []
@@ -217,6 +217,7 @@ def run_training(
 
 @pipeline
 def training_pipeline():
+    logging.info("Starting Training Pipeline in main_training.py")
     model, stats_dict = run_training()
 
 

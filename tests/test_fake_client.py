@@ -5,8 +5,6 @@ import requests
 import argparse
 from unittest.mock import MagicMock
 
-# Import the module under test.
-# Assuming fake_client.py is importable as a module.
 import scripts.fake_client as fake_client
 from scripts.fake_client import (
     generate_series,

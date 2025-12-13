@@ -3,7 +3,8 @@ import json
 import torch
 import polars as pl
 from unittest.mock import MagicMock, patch
-from main_api import create_app, ModelLoader, InputPreparer, LittleMLP
+from src.main_api import create_app, ModelLoader, InputPreparer
+from src.main_training import LittleMLP
 
 
 # --- Fixtures ---
@@ -14,7 +15,6 @@ def real_model_instance():
     Creates a real instance of LittleMLP to ensure shape compatibility
     during integration tests.
     """
-    # Matches the default config usually expected by the app
     return LittleMLP(input_size=6, hidden_size=8, num_layers=2, num_classes=2, lr=0.01)
 
 

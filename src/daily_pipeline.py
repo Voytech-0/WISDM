@@ -1,16 +1,16 @@
 import requests
 import logging
+from typing import Any
 from zenml import step, pipeline
-from configs.configs import TrainingConfig
 from main_training import run_training
 
 
-@step
+@step(enable_cache=False)
 def trigger_populate_db() -> bool:
     url = "http://db-init:5001/populate"
     try:
         logging.info(f"Triggering DB population at {url}...")
-        response = requests.post(url)
+        response = requests.get(url)
         response.raise_for_status()
         logging.info("DB Population successful.")
         return True
@@ -19,8 +19,8 @@ def trigger_populate_db() -> bool:
         raise e
 
 
-@step
-def trigger_model_reload() -> bool:
+@step(enable_cache=False)
+def trigger_model_reload(_dep: Any = None) -> bool:
     url = "http://localhost:8000/reload"
     try:
         logging.info(f"Triggering Model Reload at {url}...")
@@ -33,9 +33,9 @@ def trigger_model_reload() -> bool:
         raise e
 
 
-# The Full Pipeline
 @pipeline
 def daily_maintenance_pipeline():
-    trigger_populate_db()
-    run_training()
-    trigger_model_reload()
+    logging.info("Starting Daily Maintenance Pipeline in daily_pipeline.py")
+    db_ok = trigger_populate_db()
+    model, stats = run_training(db_ok)
+    trigger_model_reload(model)
