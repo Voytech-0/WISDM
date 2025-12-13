@@ -40,7 +40,6 @@ model_training_task = DockerOperator(
         "MYSQL_PASSWORD": "password",
         "MYSQL_DATABASE": "wisdm",
     },
-    # Use docker.types.Mount to mount the named volume `app` into the container at /app/models
     mounts=[Mount(target="/app", source="infra_app", type="volume")],
     task_id="training",
     dag=dag,

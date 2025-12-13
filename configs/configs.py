@@ -10,20 +10,13 @@ load_dotenv(dotenv_path)
 
 
 def _resolve_mysql_host():
-    """Return the configured MYSQL_HOST if it resolves on this machine, otherwise fall back to 'localhost'.
-
-    This keeps the default behavior of using 'mysql' inside Docker Compose networks
-    while making host-based runs (macOS) work without editing .env.
-    """
     env_host = os.getenv('MYSQL_HOST')
     if not env_host:
         return 'localhost'
     try:
-        # Attempt to resolve the hostname; if it fails, fall back to localhost
         socket.getaddrinfo(env_host, None)
         return env_host
     except Exception:
-        # resolution failed — fall back to localhost (useful for running on the host)
         return 'localhost'
 
 @dataclass(init=False, frozen=True)
@@ -55,14 +48,12 @@ class DataConfig:
 
 @dataclass(init=False, frozen=True)
 class MySQLConfig:
-    # Read connection details from environment so Docker Compose can override them.
     host: str = _resolve_mysql_host()
     port: int = int(os.getenv('MYSQL_PORT', '3306'))
     user: str = os.getenv('MYSQL_USER', 'user')
     password: str = os.getenv('MYSQL_PASSWORD', 'password')
     db: str = os.getenv('MYSQL_DATABASE', 'wisdm')
 
-# Add training/runtime config used by src/main_training.py
 @dataclass
 class TrainingConfig:
     seed: int = int(os.getenv('SEED', '44'))
@@ -73,5 +64,5 @@ class TrainingConfig:
     num_layers: int = int(os.getenv('NUM_LAYERS', '1'))
     num_classes: int = int(os.getenv('NUM_CLASSES', '18'))
     # model directory and default checkpoint path
-    model_dir: str = os.getenv('MODEL_DIR', str(project_root / 'models'))
-    model_path: str = os.getenv('MODEL_PATH', str(project_root / 'models' / 'mlp.ckpt'))
+    model_dir: str = str(project_root / 'models')
+    model_path: str = str(project_root / 'models' / 'mlp.ckpt')

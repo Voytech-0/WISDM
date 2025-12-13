@@ -242,8 +242,6 @@ def test_apply_z_score_normalization():
         "z": [[2.0, 2.0, 2.0], [6.0, 6.0, 6.0]],
     })
 
-    # Case 1: Compute stats (simulate Training)
-    # devA: x mean 10, std 10. devB: x mean 100, std 0.
     out_train = apply_z_score_normalization(input_lf, z_score=None)
     df_train = out_train.collect()
 
@@ -252,13 +250,9 @@ def test_apply_z_score_normalization():
     assert ('devA', 'sens1') in stats
     assert stats[('devA', 'sens1')]['x_mean'] == 10.0
 
-    # Check Normalization
-    # devA row 0 x: (0-10)/10 = -1
     row_0_x = df_train.filter(pl.col("device") == "devA").get_column("x")[0]
     np.testing.assert_allclose(row_0_x, [-1.0, 0.0, 1.0])
 
-    # Case 2: Apply specific stats (simulate Inference)
-    # Force mean 0, std 1 for devA
     fake_stats = {
         ('devA', 'sens1'): {
             'x_mean': 0.0, 'y_mean': 0.0, 'z_mean': 0.0,
@@ -279,7 +273,6 @@ def test_apply_z_score_normalization():
     out_infer = apply_z_score_normalization(input_infer, z_score=fake_stats)
     df_infer = out_infer.collect()
 
-    # (10 - 0) / 1 = 10
     row_infer_x = df_infer.get_column("x")[0]
     np.testing.assert_allclose(row_infer_x, [10.0, 10.0, 10.0])
 

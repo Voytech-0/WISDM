@@ -1,4 +1,6 @@
 
+I was aiming for the starts and did not realise I have fallen off a cliff. I wanted to use ZenML instead of Airflow to show some ambition the task has devoured me.
+
 # WISDM Activity Recognition System
 
 This project implements an activity recognition system using the WISDM smartphone and smartwatch dataset, containerized with Docker and orchestrated via Docker Compose.
@@ -33,6 +35,19 @@ MYSQL_PASSWORD=password
 MYSQL_ROOT_PASSWORD=rootpassword
 MYSQL_DATABASE=wisdm
 ```
+
+I did not manage to set up ZenML automatically, so you need to set it up manually before launching the services.
+Open localhost:8081 and create an admin user with your desired credentials.
+
+Then, log in to ZenML from your terminal:
+
+```bash
+zenml login http://localhost:8081
+```
+Now you will be abe to locally run `python src/main_training.py` and ` python src/main_api.py serve`
+
+
+zenml login http://localhost:8081
 
 ### Step 3: Launch Services
 

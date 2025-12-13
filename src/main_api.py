@@ -26,20 +26,6 @@ import atexit
 
 logging.basicConfig(level=logging.INFO)
 
-
-class _MetricsFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            msg = record.getMessage()
-            if '"GET /metrics' in msg or '"POST /metrics' in msg or ' /metrics ' in msg:
-                return False
-        except Exception:
-            return True
-        return True
-
-
-logging.getLogger('werkzeug').addFilter(_MetricsFilter())
-
 request_counter = Counter(
     'api_requests_total', 'Total API requests', ['endpoint', 'method', 'status']
 )

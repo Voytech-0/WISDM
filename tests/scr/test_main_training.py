@@ -5,9 +5,6 @@ import polars as pl
 import numpy as np
 from unittest.mock import MagicMock
 
-
-# --- Fixtures ---
-
 @pytest.fixture
 def mock_zenml(monkeypatch):
 
@@ -118,7 +115,6 @@ def test_make_dataloaders(main_training_module):
         df, batch_size=10, val_split=0.2, test_split=0.2
     )
 
-    # 100 samples: 60 train, 20 val, 20 test
     assert len(train_dl.dataset) == 60
     assert len(val_dl.dataset) == 20
     assert len(test_dl.dataset) == 20
@@ -157,7 +153,6 @@ def test_run_training_step_failure(
     mock_pipeline = MagicMock(return_value=large_df)
     monkeypatch.setattr(main_training_module, "preprocessing_pipeline_for_wisdm_raw_data", mock_pipeline)
 
-    # Should not raise exception
     model, stats = main_training_module.run_training(epochs=1, batch_size=4)
 
     assert isinstance(model, main_training_module.LittleMLP)
