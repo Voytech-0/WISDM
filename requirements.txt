@@ -10,5 +10,5 @@ python-dotenv==1.0.0
 requests==2.31.0
 prometheus_flask_exporter==0.22.0
 prometheus_client==0.17.0
-zenml[aim,local]>=0.92.0
+zenml[local]>=0.92.0
 APScheduler==3.10.4

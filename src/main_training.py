@@ -12,8 +12,6 @@ import json
 from zenml import step, pipeline
 from typing_extensions import Annotated
 
-import aim
-
 from configs.configs import TrainingConfig
 from preprocessing.preprocess import preprocessing_pipeline_for_wisdm_raw_data, get_z_score
 
@@ -144,7 +142,6 @@ def make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1):
     return train_loader, val_loader, test_loader
 
 
-@step(experiment_tracker="aim_tracker")
 def run_training(
         epochs: int = TrainingConfig.max_epochs,
         batch_size: int = TrainingConfig.batch_size,
@@ -155,20 +152,7 @@ def run_training(
 ]:
     """
     Run training and return the model and stats as ZenML artifacts.
-    Logs metadata and metrics to Aim.
     """
-
-    try:
-        run = aim.Run(experiment="wisdm_training")
-        run["hparams"] = {
-            "epochs": epochs,
-            "batch_size": batch_size,
-            "lr": lr,
-            "model_architecture": "LittleMLP"
-        }
-    except Exception as e:
-        logging.warning(f"Aim run could not be initialized: {e}")
-        run = None
 
     data = preprocessing_pipeline_for_wisdm_raw_data()
 
@@ -176,8 +160,6 @@ def run_training(
     try:
         stats_lf = get_z_score()
         stats_dict = stats_lf.collect().to_dicts()
-        if run:
-            run["data/z_score_stats"] = stats_dict
     except Exception as e:
         logging.warning("Failed to load or save z-score stats: %s", e)
 
@@ -224,17 +206,11 @@ def run_training(
 
         logging.info(f"Epoch {epoch}/{epochs} train_loss={train_loss_avg:.4f} val_loss={val_loss_avg:.4f}")
 
-        if run:
-            run.track(train_loss_avg, name="loss", context={"subset": "train"}, epoch=epoch)
-            run.track(val_loss_avg, name="loss", context={"subset": "val"}, epoch=epoch)
 
         if val_loss_avg < best_val_loss:
             best_val_loss = val_loss_avg
 
     model.to('cpu')
-
-    if run:
-        run.close()
 
     return model, stats_dict
 

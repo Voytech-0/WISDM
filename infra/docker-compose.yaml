@@ -2,7 +2,7 @@ services:
 
   app:
     image: wisdm:latest
-    command: python src/main_api.py serve 8000
+    command: python src/main_api.py serve
     ports:
       - "8000:8000"
     env_file:
@@ -11,12 +11,8 @@ services:
     depends_on:
       db-init:
         condition: service_started
-      aim-server:
-        condition: service_started
       zenml:
         condition: service_started
-    environment:
-      - AIM_REMOTE_SERVER_URL=aim://aim-server:43800
     volumes:
       - ./zenml_artifacts:/root/.config/zenml
     healthcheck:
@@ -113,20 +109,6 @@ services:
       - zenml_server_data:/data
     healthcheck:
       test: wget --no-verbose --tries=1 --spider http://localhost:8080/api/v1/health || exit 1
-      interval: 10s
-      retries: 5
-
-  aim-server:
-    image: aimstack/aim:latest
-    container_name: aim_server
-    command: server --host 0.0.0.0 --port 43800
-    ports:
-      - "43800:43800"
-    volumes:
-      - ./aim_data:/opt/aim
-    restart: always
-    healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:43800/status" ]
       interval: 10s
       retries: 5
 
