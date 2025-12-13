@@ -1,6 +1,7 @@
 # ensure the project root is on sys.path so `import src...` works when pytest runs
 import sys
 from pathlib import Path
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -8,7 +9,7 @@ if str(ROOT) not in sys.path:
 import pytest
 import torch
 from click.testing import CliRunner
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, MagicMock
 import src.main_api as main_api
 from types import SimpleNamespace
 
@@ -20,7 +21,7 @@ class DummyModel(torch.nn.Module):
         super().__init__()
         self.num_classes = num_classes
         # mimic saved hparams used by InputPreparer
-        self.hparams = {'input_size': None}
+        self.hparams = {'input_size': 2}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # simple deterministic rule: class = int(sum(features)) % num_classes
@@ -34,13 +35,14 @@ class DummyModel(torch.nn.Module):
 
 
 class StubLoader:
-    def __init__(self, model: DummyModel):
+
+    def __init__(self, model: DummyModel, stats=None):
         self._model = model
-        # provide a checkpoint_path attribute to satisfy logging in reload endpoint
-        self.checkpoint_path = "stub"
+        self.z_score_stats = stats or []
 
     def load(self, force_reload: bool = False):
-        return self._model
+        # The new interface returns a tuple
+        return self._model, self.z_score_stats
 
 
 def test_create_app_request_timing():
@@ -56,6 +58,7 @@ def test_create_app_request_timing():
 
 
 def test_create_app_reload_model():
+    # Initial setup with 3 classes
     loader = StubLoader(DummyModel(num_classes=3))
     preparer = InputPreparer()
     app = create_app(loader, preparer)
@@ -71,7 +74,9 @@ def test_create_app_reload_model():
     assert len(out[0]['probs']) == 3
 
     # change underlying model to different num_classes and reload
+    # We simulate an update in the loader
     loader._model = DummyModel(num_classes=2)
+
     r = client.post('/reload')
     assert r.status_code == 200
     assert r.get_json() == {"status": "reloaded"}
@@ -102,102 +107,133 @@ def test_create_app_predict():
 
 
 def test_serve():
-
     runner = CliRunner()
     loader_instance = Mock(name='loader')
+    # loader.load() must return a tuple (model, stats) now
+    loader_instance.load.return_value = (Mock(), [])
+
     preparer_instance = Mock(name='preparer')
     app_mock = Mock(name='flask_app')
     app_mock.run = Mock(name='run')
 
     with patch('src.main_api.ModelLoader') as MockLoaderCls, \
-         patch('src.main_api.InputPreparer') as MockPreparerCls, \
-         patch('src.main_api.create_app') as mock_create_app:
+            patch('src.main_api.InputPreparer') as MockPreparerCls, \
+            patch('src.main_api.create_app') as mock_create_app:
         MockLoaderCls.return_value = loader_instance
         MockPreparerCls.return_value = preparer_instance
         mock_create_app.return_value = app_mock
 
         host = '127.0.0.1'
         port = '9010'
-        result = runner.invoke(main_api.cli, ['serve', '--host', host, port])
+        pipeline_name = "my_training_pipeline"
+
+        # Test that CLI accepts the new --pipeline argument
+        result = runner.invoke(main_api.cli, ['serve', '--host', host, '--port', port, '--pipeline', pipeline_name])
 
     assert result.exit_code == 0
-    assert MockLoaderCls.called, "ModelLoader should be instantiated"
+
+    # Check that ModelLoader was initialized with the pipeline name
+    MockLoaderCls.assert_called_once_with(pipeline_name=pipeline_name)
     assert MockPreparerCls.called, "InputPreparer should be instantiated"
+
     mock_create_app.assert_called_once_with(loader_instance, preparer_instance)
     app_mock.run.assert_called_once_with(host=host, port=int(port))
 
-class FakeLittleMLP(torch.nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes, lr=None):
-        super().__init__()
-        # minimal layers so state_dict() has content
-        self.fc = torch.nn.Linear(input_size, num_classes)
 
-    def forward(self, x):
-        return self.fc(x)
+# --- New ModelLoader Tests (Mocking ZenML) ---
 
-def test_modelLoader_load_cached(tmp_path):
+@patch('src.main_api.Client')
+def test_modelLoader_load_success(MockClient):
+    """
+    Test that ModelLoader correctly interacts with the ZenML Client
+    to fetch the pipeline, run, and artifacts.
+    """
+    # 1. Setup the Mock Chain
+    mock_client_instance = MockClient.return_value
+    mock_pipeline = MagicMock()
+    mock_run = MagicMock()
+    mock_step_outputs = MagicMock()
 
+    # Artifact Mocks
+    mock_model_artifact = MagicMock()
+    mock_stats_artifact = MagicMock()
 
-    hparams = {
-        'input_size': 2,
-        'hidden_size': 4,
-        'num_layers': 1,
-        'num_classes': 3,
-        'lr': 0.01,
+    # The actual python objects returned by .load()
+    real_model_obj = DummyModel(num_classes=3)
+    real_stats_obj = [{"mean": 0.5, "std": 1.0}]
+
+    mock_model_artifact.load.return_value = real_model_obj
+    mock_stats_artifact.load.return_value = real_stats_obj
+
+    # Chain them together
+    mock_client_instance.get_pipeline.return_value = mock_pipeline
+    mock_pipeline.last_successful_run = mock_run
+
+    # Simulate the dictionary of outputs from the step
+    # Keys must match what is in main_api.py (run_training step)
+    mock_run.steps.__getitem__.return_value.outputs = {
+        "trained_model": mock_model_artifact,
+        "z_score_stats": mock_stats_artifact
     }
-    model = FakeLittleMLP(
-        input_size=hparams['input_size'],
-        hidden_size=hparams['hidden_size'],
-        num_layers=hparams['num_layers'],
-        num_classes=hparams['num_classes'],
-        lr=hparams['lr'],
-    )
 
-    ckpt = {'model_state_dict': model.state_dict(), 'hparams': hparams}
-    ckpt_path = tmp_path / 'ckpt.pth'
-    torch.save(ckpt, str(ckpt_path))
+    # 2. Execute
+    loader = ModelLoader(pipeline_name="test_pipe", step_name="test_step")
+    loaded_model, loaded_stats = loader.load()
 
-    loaded = ModelLoader._load_cached(str(ckpt_path), FakeLittleMLP)
-    assert hasattr(loaded, 'hparams')
-    assert int(loaded.hparams['input_size']) == hparams['input_size']
-    assert isinstance(loaded, FakeLittleMLP)
+    # 3. Assertions
+    assert isinstance(loaded_model, DummyModel)
+    assert loaded_stats == real_stats_obj
+
+    mock_client_instance.get_pipeline.assert_called_with("test_pipe")
+    mock_model_artifact.load.assert_called_once()
+    mock_stats_artifact.load.assert_called_once()
 
 
-def test_modelLoader_load(tmp_path):
+@patch('src.main_api.Client')
+def test_modelLoader_load_caching(MockClient):
+    """
+    Test that the loader caches the model and doesn't hit ZenML again
+    unless force_reload is True.
+    """
+    mock_client_instance = MockClient.return_value
+    mock_pipeline = MagicMock()
+    mock_run = MagicMock()
 
-    hparams = {
-        'input_size': 2,
-        'hidden_size': 4,
-        'num_layers': 1,
-        'num_classes': 3,
-        'lr': 0.01,
+    mock_client_instance.get_pipeline.return_value = mock_pipeline
+    mock_pipeline.last_successful_run = mock_run
+
+    # Mock return values
+    mock_model_artifact = MagicMock()
+    mock_model_artifact.load.return_value = DummyModel()
+    mock_run.steps.__getitem__.return_value.outputs = {
+        "trained_model": mock_model_artifact,
+        "z_score_stats": MagicMock()  # stats
     }
-    model = FakeLittleMLP(
-        input_size=hparams['input_size'],
-        hidden_size=hparams['hidden_size'],
-        num_layers=hparams['num_layers'],
-        num_classes=hparams['num_classes'],
-        lr=hparams['lr'],
-    )
 
-    ckpt = {'model_state_dict': model.state_dict(), 'hparams': hparams}
-    ckpt_path = tmp_path / 'ckpt2.pth'
-    torch.save(ckpt, str(ckpt_path))
+    loader = ModelLoader()
 
-    loader = ModelLoader(checkpoint_path=str(ckpt_path), model_cls=model.__class__)
-    m1 = loader.load()
-    assert isinstance(m1, model.__class__)
+    # First load
+    m1, s1 = loader.load()
+    assert MockClient.call_count == 1
 
-    m2 = loader.load(force_reload=True)
-    assert isinstance(m2, model.__class__)
-    assert m1 is not m2  # should be different instances
+    # Second load (should be cached)
+    m2, s2 = loader.load()
+    assert MockClient.call_count == 1  # Still 1
+    assert m1 is m2
+
+    # Force reload
+    m3, s3 = loader.load(force_reload=True)
+    assert MockClient.call_count == 2  # Increased
 
 
-def test_input_preparer_is_raw():
+def test_input_preparer_stats():
+    """Test that InputPreparer can hold and update stats."""
     prep = InputPreparer()
-    assert prep._is_raw({'x': [1], 'y': [2], 'z': [3]})
-    assert not prep._is_raw({'a': 1, 'b': 2})
-    assert not prep._is_raw(None)
+    assert prep.z_score_stats == []
+
+    new_stats = [{"col": "x", "mean": 10}]
+    prep.set_stats(new_stats)
+    assert prep.z_score_stats == new_stats
 
 
 def test_input_preparer_prepare():
@@ -214,7 +250,96 @@ def test_input_preparer_prepare():
     assert t.shape[0] == 1
     assert t.shape[1] == 2
 
+    # Test dimension validation
     model = SimpleNamespace()
-    model.hparams = SimpleNamespace(input_size=1)
-    with pytest.raises(ValueError):
+    # production code expects hparams as a dict; set it accordingly in the test
+    model.hparams = {'input_size': 1}  # Model expects 1 feature
+
+    # Input has 2 features -> Should raise ValueError
+    with pytest.raises(ValueError) as excinfo:
         prep.prepare(data, model=model)
+    assert "features but model expects 1" in str(excinfo.value)
+
+
+def test_predict_when_model_none_initially(monkeypatch):
+    """If the app starts with no model available, /predict should attempt to load it and still succeed when loader becomes available."""
+    # loader whose first call raises, second call returns a model
+    class FlakyLoader:
+        def __init__(self, model):
+            self.model = model
+            self.called = 0
+
+        def load(self, force_reload: bool = False):
+            self.called += 1
+            if self.called == 1:
+                raise RuntimeError("no model yet")
+            return self.model, []
+
+    # Avoid starting the real scheduler inside create_app during tests
+    class DummyScheduler:
+        def __init__(self):
+            pass
+        def add_job(self, *args, **kwargs):
+            pass
+        def start(self):
+            pass
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr('src.main_api.BackgroundScheduler', DummyScheduler)
+
+    loader = FlakyLoader(DummyModel())
+    preparer = InputPreparer()
+    app = create_app(loader, preparer)
+    client = app.test_client()
+
+    # At startup loader.load() should have been called and failed, leaving model None
+    # Now /predict should trigger another load and succeed
+    payload = [{"a": 1.0, "b": 2.0}]
+    r = client.post('/predict', json=payload)
+    assert r.status_code == 200
+    out = r.get_json()
+    assert isinstance(out, list) and len(out) == 1
+
+
+def test_train_endpoint_triggers_pipeline(monkeypatch):
+    """/train should return 202 and trigger the training pipeline in a background thread."""
+    # Avoid starting the real scheduler inside create_app during tests
+    class DummyScheduler:
+        def __init__(self):
+            pass
+        def add_job(self, *args, **kwargs):
+            pass
+        def start(self):
+            pass
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr('src.main_api.BackgroundScheduler', DummyScheduler)
+
+    loader = StubLoader(DummyModel())
+    preparer = InputPreparer()
+    app = create_app(loader, preparer)
+    client = app.test_client()
+
+    called = {"flag": False}
+
+    def fake_training_pipeline():
+        called["flag"] = True
+
+    # Patch the training_pipeline function so the background thread calls our fake
+    monkeypatch.setattr('src.main_api.training_pipeline', fake_training_pipeline)
+
+    r = client.get('/train')
+    assert r.status_code == 202
+    j = r.get_json()
+    assert j["status"] == "Training started"
+
+    # wait briefly for the background thread to run the fake
+    import time
+    timeout = time.time() + 2.0
+    while not called["flag"] and time.time() < timeout:
+        time.sleep(0.01)
+
+    assert called["flag"] is True
+

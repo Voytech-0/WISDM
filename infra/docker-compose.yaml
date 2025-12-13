@@ -12,9 +12,9 @@ services:
       db-init:
         condition: service_started
       aim-server:
-        condition: service_healthy
+        condition: service_started
       zenml:
-        condition: service_healthy
+        condition: service_started
     environment:
       - AIM_REMOTE_SERVER_URL=aim://aim-server:43800
     volumes:
@@ -119,7 +119,7 @@ services:
   aim-server:
     image: aimstack/aim:latest
     container_name: aim_server
-    command: aim server --host 0.0.0.0 --port 43800
+    command: server --host 0.0.0.0 --port 43800
     ports:
       - "43800:43800"
     volumes:

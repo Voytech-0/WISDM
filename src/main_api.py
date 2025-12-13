@@ -15,8 +15,8 @@ import polars as pl
 from zenml.client import Client
 from zenml.exceptions import DoesNotExistException
 
-# App Imports
-from main_training import LittleMLP  # Class def needed for unpickling
+from daily_pipeline import daily_maintenance_pipeline
+from main_training import LittleMLP, training_pipeline
 from preprocessing.preprocess import expand_raw_items_to_expanded_df
 from prometheus_flask_exporter import PrometheusMetrics
 from prometheus_client import Counter, Histogram

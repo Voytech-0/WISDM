@@ -7,3 +7,5 @@ docker build -f infra/build/Dockerfile . -t wisdm:latest
 docker compose -f infra/docker-compose.yaml up -d mysql
 
 docker compose -f infra/docker-compose.yaml run db-init
+
+docker compose -f infra/docker-compose.yaml  run --rm aim-server init
