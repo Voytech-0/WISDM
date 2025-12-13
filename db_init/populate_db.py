@@ -20,10 +20,6 @@ ENGINE = None
 
 
 def get_connected_engine(timeout_s: int = 60):
-    """
-    Create (lazily) and return the module-level SQLAlchemy engine, and wait until the DB is available.
-    Raises RuntimeError if the DB is not available within timeout_s.
-    """
     global ENGINE
     if ENGINE is None:
         url = f"mysql+pymysql://{MySQLConfig.user}:{MySQLConfig.password}@{MySQLConfig.host}:{MySQLConfig.port}/{MySQLConfig.db}"
@@ -67,11 +63,11 @@ def create_table(engine):
     """
     with engine.connect() as conn:
         conn.execute(text(create_table_query))
+        conn.commit()
     logging.info("Ensured table wisdm_raw exists.")
 
 
 def create_status_table(engine):
-    """Create a small key/value table to persist init status across container restarts."""
     q = """
     CREATE TABLE IF NOT EXISTS init_status (
         `key` VARCHAR(100) PRIMARY KEY,
@@ -81,12 +77,10 @@ def create_status_table(engine):
     """
     with engine.connect() as conn:
         conn.execute(text(q))
+        conn.commit()
 
 
 def set_status_in_db(key: str = None, value: str = None):
-    """
-    Upsert a key/value into init_status. Uses the shared connected engine.
-    """
     if key is None:
         raise ValueError("key is required")
 
@@ -98,12 +92,11 @@ def set_status_in_db(key: str = None, value: str = None):
     """
     with engine.connect() as conn:
         conn.execute(text(query), {"k": key, "v": value})
+        conn.commit()
+        logging.info("Set init_status key=%s to value=%s", key, value)
 
 
 def get_status_from_db(key: str = None) -> str | None:
-    """
-    Read a value from init_status. Returns the stored string value or None if not present / not reachable.
-    """
     if key is None:
         raise ValueError("key is required")
 
@@ -119,6 +112,8 @@ def get_status_from_db(key: str = None) -> str | None:
             r = conn.execute(text(q), {"k": key}).fetchone()
             if r:
                 return r[0]
+            logging.info("No entry found in init_status for key=%s", key)
+            logging.info("r: %s", r)
     except Exception:
         logging.debug("Could not read init_status from DB (it may not be ready)")
     return None
@@ -154,6 +149,7 @@ def parse_and_insert(prefix_path: str):
     logging.info("Building lazy frame for all raw files...")
     lf = load_data_raw_with_row_per_sensor_device_activity_subject(prefix_path)
 
+
     try:
         logging.info("Collecting lazy frame into memory (Polars DataFrame)")
         df_pl = lf.collect()
@@ -184,10 +180,6 @@ def parse_and_insert(prefix_path: str):
 
 
 def insert_using_load_data(df: pl.DataFrame, table_name: str = 'wisdm_raw') -> bool:
-    """
-    Bulk-load Polars DataFrame into MySQL using LOAD DATA LOCAL INFILE.
-    """
-
     if df.height == 0:
         logging.info("DataFrame is empty, nothing to insert")
         return True
@@ -219,7 +211,7 @@ def insert_using_load_data(df: pl.DataFrame, table_name: str = 'wisdm_raw') -> b
                 password=MySQLConfig.password,
                 database=MySQLConfig.db,
                 port=int(MySQLConfig.port),
-                local_infile=True, # Enables client capability
+                local_infile=True,
                 autocommit=False,
             )
             cursor = conn.cursor()
@@ -254,6 +246,7 @@ def insert_using_load_data(df: pl.DataFrame, table_name: str = 'wisdm_raw') -> b
 def is_populated():
     try:
         val = get_status_from_db('is_populated')
+        logging.info("is_populated status from DB: %s", val)
         return val in ('1', 'true', 'True')
     except Exception:
         logging.debug('Could not determine persisted populate status')
@@ -261,12 +254,6 @@ def is_populated():
 
 
 def populate(prefix_path: str = None) -> tuple[bool, str]:
-    """
-    Populate the database from raw files. Returns (success: bool, reason: str).
-
-    success == True indicates the database is populated (either already or after this call).
-    success == False indicates the operation did not populate the DB (e.g., lock not acquired or error).
-    """
     if prefix_path is None:
         prefix_path = DataConfig.data_path_prefix
 
@@ -281,11 +268,6 @@ def populate(prefix_path: str = None) -> tuple[bool, str]:
         logging.debug('Could not create init_status table before reading status')
 
     try:
-        persisted = get_status_from_db('is_populated')
-        if persisted in ('1', 'true', 'True'):
-            logging.info('Database already populated according to init_status; skipping populate')
-            return (True, 'already_populated')
-
         create_table(engine)
         parse_and_insert(prefix_path)
         try:
@@ -315,11 +297,12 @@ def status_endpoint():
 def populate_endpoint():
 
     try:
-        persisted = get_status_from_db('is_populated')
-        if persisted in ('1', 'true', 'True'):
+        if is_populated():
             return jsonify({'started': False, 'populated': True, 'reason': 'already_populated'}), HTTPStatus.OK
+        else:
+            logging.info('Database not populated at start of /populate.')
     except Exception:
-        logging.debug('Population status unknown at start of /populate')
+        logging.info('Population status unknown at start of /populate')
 
     success, reason = populate()
     if success:
