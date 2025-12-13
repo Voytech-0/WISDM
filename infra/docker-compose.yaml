@@ -10,9 +10,9 @@ services:
 
     depends_on:
       db-init:
-      - condition: service_started
+        condition: service_started
       aim-server:
-      - condition: service_healthy
+        condition: service_healthy
       zenml:
         condition: service_healthy
     environment:

@@ -13,13 +13,17 @@ import polars as pl
 
 # ZenML Imports
 from zenml.client import Client
-from zenml.exceptions import EntityNotFoundError
+from zenml.exceptions import DoesNotExistException
 
 # App Imports
 from main_training import LittleMLP  # Class def needed for unpickling
 from preprocessing.preprocess import expand_raw_items_to_expanded_df
 from prometheus_flask_exporter import PrometheusMetrics
 from prometheus_client import Counter, Histogram
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import atexit
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
@@ -88,7 +92,7 @@ class ModelLoader:
                 logging.info("Successfully loaded model and stats from ZenML.")
                 return self._cached_model, self._cached_stats
 
-            except EntityNotFoundError:
+            except DoesNotExistException:
                 logging.error(f"Pipeline '{self.pipeline_name}' not found in ZenML store.")
                 raise
             except Exception as e:
@@ -185,6 +189,31 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
             request_latency_histogram.labels(endpoint, request.method, status).observe(elapsed)
             request_counter.labels(endpoint, request.method, status).inc()
         return response
+
+    def scheduled_job():
+        """Function to be run by the scheduler."""
+        logging.info("Scheduler waking up.")
+        try:
+            # Run the ZenML pipeline directly
+            daily_maintenance_pipeline()
+            logging.info("Daily Pipeline finished successfully.")
+        except Exception as e:
+            logging.error(f"Daily Pipeline failed: {e}")
+
+    scheduler = BackgroundScheduler()
+
+    scheduler.add_job(
+        func=scheduled_job,
+        trigger=CronTrigger(hour=0, minute=0),
+        id='daily_pipeline_job',
+        name='Daily ZenML Pipeline',
+        replace_existing=True
+    )
+
+    scheduler.start()
+    logging.info("Scheduler started: Daily pipeline set for 00:00.")
+
+    atexit.register(lambda: scheduler.shutdown())
 
     @app.route("/health", methods=["GET"])
     @metrics.do_not_track()
