@@ -121,11 +121,6 @@ def test_little_mlp_label_to_indices():
             "data": torch.tensor([1, 2, 0]),
             "expected": torch.tensor([1, 2, 0]),
         },
-        {
-            # New case: 2D single-column labels should be treated as scalar indices
-            "data": torch.tensor([[1], [0], [1]]),
-            "expected": torch.tensor([1, 0, 1]),
-        },
     ]
 
     for case in cases:

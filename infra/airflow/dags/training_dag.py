@@ -19,7 +19,7 @@ perhaps_populate_task = DockerOperator(
     image="curlimages/curl:8.4.0",
     command=(
         "sh -c 'set -euo pipefail; code=$(curl -sS -o /dev/null -w \"%{http_code}\" http://db-init:5001/populate || true); "
-        "if [ \"$code\" = \"202\" ] || [ \"$code\" = \"409\" ]; then echo \"populate returned $code\"; exit 0; else echo \"Unexpected HTTP code: $code\"; exit 2; fi'"
+        "if [ \"$code\" = \"200\" ] || [ \"$code\" = \"409\" ]; then echo \"populate returned $code\"; exit 0; else echo \"Unexpected HTTP code: $code\"; exit 2; fi'"
     ),
     network_mode="infra_default",
     mount_tmp_dir=False,

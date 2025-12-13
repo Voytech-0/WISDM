@@ -1,23 +1,24 @@
 services:
 
   app:
-
-#    build:
-#      context: ..
-#      dockerfile: infra/build/Dockerfile
     image: wisdm:latest
     command: python src/main_api.py serve 8000
     ports:
       - "8000:8000"
     env_file:
       - ../.env
-    volumes:
-      - app:/app
 
     depends_on:
       db-init:
-        condition: service_started # here we do not wait for full population of mysql.
-
+      - condition: service_started
+      aim-server:
+      - condition: service_healthy
+      zenml:
+        condition: service_healthy
+    environment:
+      - AIM_REMOTE_SERVER_URL=aim://aim-server:43800
+    volumes:
+      - ./zenml_artifacts:/root/.config/zenml
     healthcheck:
       test: ["CMD-SHELL", "curl --fail http://localhost:8000/health || exit 1"]
       interval: 5s
@@ -44,25 +45,6 @@ services:
       - "9091:9091"
     healthcheck:
       test: wget http://localhost:9091/metrics -S -O - || exit 1
-      retries: 3
-      interval: 5s
-
-  airflow:
-    image: apache/airflow:3.1.0-python3.10
-    command: airflow standalone
-    ports:
-      - "4242:8080"  # note: We need to use a different port than 8080 as it is already assigned for mlflow.
-    environment:
-      - _AIRFLOW_DB_MIGRATE=true
-      - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=true  # note: Disabling authentication completely.
-    env_file:
-      - ../.env
-    volumes:
-      - ./airflow/dags/:/opt/airflow/dags  # note: Normally you pass DAGs to Airflow in a different way, through CI. Like moving to a Cloud Storage Directory where Airflow is getting the DAGs from.
-      - /var/run/docker.sock:/var/run/docker.sock  # note: For local deployment: linking local docker to Airflow
-      - app:/app
-    healthcheck:
-      test: wget http://localhost:8080/api/v2/monitor/health -o /dev/null || exit 1  # note: wget downloads the file. I do not need it. So we move it to /dev/null
       retries: 3
       interval: 5s
 
@@ -121,6 +103,33 @@ services:
       interval: 10s
       retries: 5
 
+  zenml:
+    image: "zenmldocker/zenml-server:latest"
+    environment:
+      - ZENML_SERVER_DB_URL=sqlite:////data/zenml-server.db
+    ports:
+      - "8081:8080"
+    volumes:
+      - zenml_server_data:/data
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8080/api/v1/health || exit 1
+      interval: 10s
+      retries: 5
+
+  aim-server:
+    image: aimstack/aim:latest
+    container_name: aim_server
+    command: aim server --host 0.0.0.0 --port 43800
+    ports:
+      - "43800:43800"
+    volumes:
+      - ./aim_data:/opt/aim
+    restart: always
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:43800/status" ]
+      interval: 10s
+      retries: 5
+
 volumes:
   mysql_data:
-  app:
+  zenml_server_data:

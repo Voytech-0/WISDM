@@ -11,4 +11,5 @@ requests==2.31.0
 SQLAlchemy==2.0.20
 prometheus_flask_exporter==0.22.0
 prometheus_client==0.17.0
-
+zenml>=0.41.0
+aim==2.1.1

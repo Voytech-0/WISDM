@@ -1,29 +1,25 @@
 import logging
 from pathlib import Path
-import click
-
 import random
 import numpy as np
 import torch
 import polars as pl
-from typing import Tuple
+from typing import Tuple, Dict, List
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
-import time
-from configs.configs import TrainingConfig
-from preprocessing.preprocess import preprocessing_pipeline_for_wisdm_raw_data
+import json
 
-# configure basic logging for CLI/info output
+from zenml import step, pipeline
+from typing_extensions import Annotated
+
+import aim
+
+from configs.configs import TrainingConfig
+from preprocessing.preprocess import preprocessing_pipeline_for_wisdm_raw_data, get_z_score
+
 logging.basicConfig(level=logging.INFO)
 
-
-# seed RNGs using config
-try:
-    seed_val = TrainingConfig.seed
-except Exception:
-    # fall back to a simple default if CFG doesn't provide seed
-    logging.warning("TrainingConfig.seed not found, using default seed 44")
-    seed_val = 44
+seed_val = TrainingConfig.seed
 
 torch.manual_seed(seed_val)
 np.random.seed(seed_val)
@@ -148,22 +144,44 @@ def make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1):
     return train_loader, val_loader, test_loader
 
 
-@click.group()
-def cli():
-    pass
+@step(experiment_tracker="aim_tracker")
+def run_training(
+        epochs: int = TrainingConfig.max_epochs,
+        batch_size: int = TrainingConfig.batch_size,
+        lr: float = TrainingConfig.lr
+) -> Tuple[
+    Annotated[nn.Module, "trained_model"],
+    Annotated[List[Dict], "z_score_stats"]
+]:
+    """
+    Run training and return the model and stats as ZenML artifacts.
+    Logs metadata and metrics to Aim.
+    """
 
+    try:
+        run = aim.Run(experiment="wisdm_training")
+        run["hparams"] = {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "model_architecture": "LittleMLP"
+        }
+    except Exception as e:
+        logging.warning(f"Aim run could not be initialized: {e}")
+        run = None
 
-@cli.command()
-@click.option("--epochs", default=TrainingConfig.max_epochs, type=int)
-@click.option("--batch-size", default=TrainingConfig.batch_size, type=int)
-@click.option("--lr", default=TrainingConfig.lr, type=float)
-@click.option("--checkpoint", default=None, help="Optional path to resume checkpoint")
-def train(epochs, batch_size, lr, checkpoint):
-    """Train the model using plain PyTorch (no Lightning)."""
     data = preprocessing_pipeline_for_wisdm_raw_data()
 
-    train_loader, val_loader, _ = make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1)
+    stats_dict = []
+    try:
+        stats_lf = get_z_score()
+        stats_dict = stats_lf.collect().to_dicts()
+        if run:
+            run["data/z_score_stats"] = stats_dict
+    except Exception as e:
+        logging.warning("Failed to load or save z-score stats: %s", e)
 
+    train_loader, val_loader, _ = make_dataloaders(data, batch_size)
     input_size = data.width - len([col for col in data.columns if col.startswith("label")])
 
     model = LittleMLP(input_size=input_size, hidden_size=TrainingConfig.hidden_size,
@@ -171,92 +189,60 @@ def train(epochs, batch_size, lr, checkpoint):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # Prepare model dir
-    model_dir_path = Path(TrainingConfig.model_dir)
-    model_dir_path.mkdir(parents=True, exist_ok=True)
-
     best_val_loss = float('inf')
-    start_time = time.time()
-
-    # Optionally resume
-    if checkpoint:
-        try:
-            ckpt = torch.load(checkpoint, map_location=device)
-            if 'model_state_dict' in ckpt:
-                model.load_state_dict(ckpt['model_state_dict'])
-            else:
-                model.load_state_dict(ckpt)
-            logging.info(f"Resumed model weights from checkpoint: {checkpoint}")
-        except Exception as e:
-            logging.warning(f"Failed to load checkpoint {checkpoint}: {e}")
 
     for epoch in range(1, epochs + 1):
         model.train()
         train_losses = []
-        train_accs = []
 
         for x_batch, y_batch in train_loader:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
             logits = model(x_batch)
             y_idx = LittleMLP._label_to_indices(y_batch)
             loss = criterion(logits, y_idx)
             loss.backward()
             optimizer.step()
-
-            preds = torch.argmax(logits, dim=1)
-            acc = (preds == y_idx).float().mean().item()
             train_losses.append(loss.item())
-            train_accs.append(acc)
 
-        # validation
+        train_loss_avg = float(np.mean(train_losses))
+
         model.eval()
         val_losses = []
-        val_accs = []
-        all_preds = []
         with torch.no_grad():
             for x_batch, y_batch in val_loader:
                 y_batch = y_batch.to(device)
                 logits = model(x_batch)
                 y_idx = LittleMLP._label_to_indices(y_batch)
                 loss = criterion(logits, y_idx)
-                preds = torch.argmax(logits, dim=1)
-                acc = (preds == y_idx).float().mean().item()
                 val_losses.append(loss.item())
-                val_accs.append(acc)
-                all_preds.append(preds.cpu().numpy())
+
+        val_loss_avg = float(np.mean(val_losses)) if val_losses else float('inf')
+
+        logging.info(f"Epoch {epoch}/{epochs} train_loss={train_loss_avg:.4f} val_loss={val_loss_avg:.4f}")
+
+        if run:
+            run.track(train_loss_avg, name="loss", context={"subset": "train"}, epoch=epoch)
+            run.track(val_loss_avg, name="loss", context={"subset": "val"}, epoch=epoch)
+
+        if val_loss_avg < best_val_loss:
+            best_val_loss = val_loss_avg
+
+    model.to('cpu')
+
+    if run:
+        run.close()
+
+    return model, stats_dict
 
 
-        train_loss = float(np.mean(train_losses)) if train_losses else 0.0
-        train_acc = float(np.mean(train_accs)) if train_accs else 0.0
-        val_loss = float(np.mean(val_losses)) if val_losses else float('inf')
-        val_acc = float(np.mean(val_accs)) if val_accs else 0.0
-        preds_dict = {}
-        for batch_preds in all_preds:
-            for p in batch_preds:
-                preds_dict[int(p)] = preds_dict.get(p, 0) + 1
-
-        logging.info(f"Epoch {epoch}/{epochs}  train_loss={train_loss:.4f} train_acc={train_acc:.4f}  val_loss={val_loss:.4f} val_acc={val_acc:.4f} Predictions={preds_dict}")
-
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            try:
-                dest = Path(TrainingConfig.model_path)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({'model_state_dict': model.state_dict(), 'hparams': model.hparams}, str(dest))
-                logging.info(f"Saved new best model to: {dest}")
-            except Exception as e:
-                logging.error("Failed to save best model: %s", e, exc_info=True)
-
-    total_time = time.time() - start_time
-    logging.info(f"Training finished in {total_time:.1f}s. Best val_loss={best_val_loss:.4f}")
+@pipeline
+def training_pipeline():
+    model, stats_dict = run_training()
 
 
 if __name__ == "__main__":
-    cli()
+    training_pipeline()

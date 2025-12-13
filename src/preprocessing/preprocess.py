@@ -195,28 +195,19 @@ def convert_data_to_fixed_length_intervals(lf: pl.LazyFrame) -> pl.LazyFrame:
     )
     return result_lf
 
-
-def get_z_score_stats() -> pl.LazyFrame:
-    file_path = PathsConfig.z_score_params_path
-    if Path(file_path).exists():
-        with open(file_path, 'rb') as f:
-            stats_df = pickle.load(f)
-        return pl.LazyFrame(stats_df)
-    else:
-        logging.error("Z-score stats file not found at %s", file_path)
-        raise FileNotFoundError(f"Z-score stats file not found at {file_path}")
+Z_SCORE = None
 
 
-def set_z_score_stats(stats: pl.LazyFrame):
-    file_path = PathsConfig.z_score_params_path
-    path = Path(file_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df = stats.collect()
-    with open(path, "wb") as f:
-        pickle.dump(df, f)
+def get_z_score() -> Optional[pl.LazyFrame]:
+    """
+    Get the currently stored z-score normalization stats.
+    Only run after apply_z_score_normalization with train=True has been called.
+    :return: Dictionary of z-score stats.
+    """
+    global Z_SCORE
+    return Z_SCORE
 
-
-def apply_z_score_normalization(lf: pl.LazyFrame, train: bool = False, group_columns=None) -> pl.LazyFrame:
+def apply_z_score_normalization(lf: pl.LazyFrame, z_score: dict = None, group_columns=None) -> pl.LazyFrame:
     """
     Normalize each axis (x,y,z) per device, sensor, participant using z-score.
     :param lf: Input LazyFrame with columns: subject_id, device, sensor, label, x (list), y (list), z (list)
@@ -229,7 +220,7 @@ def apply_z_score_normalization(lf: pl.LazyFrame, train: bool = False, group_col
     if group_columns is None:
         group_columns = ['device', 'sensor']
 
-    if train:
+    if not z_score:
         stats = (
             lf
             .select(group_columns + ['x', 'y', 'z'])
@@ -244,10 +235,23 @@ def apply_z_score_normalization(lf: pl.LazyFrame, train: bool = False, group_col
                 pl.col('z').std().alias('z_std'),
             ])
         )
-        set_z_score_stats(stats)
+        z_score = {}
+        for row in stats.collect().to_dicts():
+            key = tuple(row[col] for col in group_columns)
+            z_score[key] = {
+                'x_mean': row['x_mean'],
+                'y_mean': row['y_mean'],
+                'z_mean': row['z_mean'],
+                'x_std': row['x_std'],
+                'y_std': row['y_std'],
+                'z_std': row['z_std'],
+            }
+        logging.info("Computed z-score normalization stats for %d groups", len(z_score))
     else:
-        stats = get_z_score_stats()
+        stats = pl.LazyFrame(z_score)
 
+    global Z_SCORE
+    Z_SCORE = z_score
 
     lf_norm = (
         lf
@@ -323,7 +327,7 @@ def preprocessing_pipeline_for_wisdm_raw_data():
         lf = load_raw_data_from_mysql()
     lf = raw_data_into_xyz_series(lf)
     lf = convert_data_to_fixed_length_intervals(lf)
-    lf = apply_z_score_normalization(lf, train=True)
+    lf = apply_z_score_normalization(lf)
     # lf = one_hot_encode(lf, ["device", "sensor", "label"])
     # DataFrame from LazyFrame
     df = collect_and_dummify_drop_subject(lf)
@@ -413,14 +417,14 @@ def collect_and_dummify_drop_subject(lf: pl.LazyFrame) -> pl.DataFrame:
     return df
 
 
-def expand_raw_items_to_expanded_df(items: List[Dict[str, Any]]) -> pl.DataFrame:
+def expand_raw_items_to_expanded_df(items: List[Dict[str, Any]], z_score) -> pl.DataFrame:
     """High-level helper: run raw items through chunking, normalization, collecting/dummify, and expansion.
 
     Returns a Polars DataFrame with expanded scalar feature columns (x_0.., y_0.., z_0..)
     """
     lf = build_raw_lazyframe_from_items(items)
     lf = lazyframe_to_single_10s(lf)
-    lf_norm = apply_z_score_normalization(lf, train=False, group_columns=['device', 'sensor'])
+    lf_norm = apply_z_score_normalization(lf, z_score=z_score, group_columns=['device', 'sensor'])
     df_norm = collect_and_dummify_drop_subject(lf_norm)
     df_expanded = expand_lists(df_norm, ['x', 'y', 'z'])
     return df_expanded
