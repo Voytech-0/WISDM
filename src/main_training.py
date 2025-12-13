@@ -1,56 +1,42 @@
 import logging
 import random
+import json
+import os
 import numpy as np
 import torch
-import polars as pl
-from typing import Tuple, Dict, List, Any
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
-
-from zenml import step, pipeline
-from typing_extensions import Annotated
+import polars as pl
+from typing import Tuple, Dict, List, Any
 
 from configs.configs import TrainingConfig
 from preprocessing.preprocess import preprocessing_pipeline_for_wisdm_raw_data, get_z_score
 
 logging.basicConfig(level=logging.INFO)
 
-seed_val = TrainingConfig.seed
+MODEL_PATH = TrainingConfig.TrainingConfig
+STATS_PATH = TrainingConfig.stats_path
 
+seed_val = TrainingConfig.seed
 torch.manual_seed(seed_val)
 np.random.seed(seed_val)
 random.seed(seed_val)
 
 
+
 class SequenceDataset(Dataset):
-    """
-    A PyTorch Dataset class that takes Polars DataFrame,
-    splits it into features (X) and labels (y), and converts all data to torch tensors.
-
-    Features are all columns *not* starting with "label".
-    Labels are all columns *starting* with "label".
-    """
-
     def __init__(self, df: pl.DataFrame):
         label_cols = [col for col in df.columns if col.startswith("label")]
         feature_cols = [col for col in df.columns if col not in label_cols]
 
         if not label_cols:
-            logging.error("No columns starting with 'label' found in the DataFrame to serve as targets (y).")
-            raise ValueError("No columns starting with 'label' found in the DataFrame to serve as targets (y).")
+            raise ValueError("No columns starting with 'label' found.")
 
         X_df = df.select(feature_cols)
         y_df = df.select(label_cols)
 
-        X_np = X_df.to_numpy()
-        y_np = y_df.to_numpy()
-
-        self.X = torch.from_numpy(X_np).float()
-        self.y = torch.from_numpy(y_np).float()
-
-        logging.info(f"Dataset initialized with {len(self.X)} samples.")
-        logging.debug(f"X shape: {self.X.shape}")
-        logging.debug(f"y shape: {self.y.shape}")
+        self.X = torch.from_numpy(X_df.to_numpy()).float()
+        self.y = torch.from_numpy(y_df.to_numpy()).float()
 
     def __len__(self) -> int:
         return self.X.shape[0]
@@ -69,18 +55,15 @@ class LittleMLP(nn.Module):
             'num_classes': int(num_classes),
             'lr': float(lr),
         }
-        self.lr = float(lr)
         self.input_size = int(input_size)
         self.hidden_size = int(hidden_size)
         self.num_layers = int(num_layers)
         self.num_classes = int(num_classes)
-
         self.dropout = nn.Dropout(p=0.3)
 
         layers = []
-        num_layers = max(1, self.num_layers)
         in_dim = self.input_size
-        for i in range(num_layers):
+        for i in range(max(1, self.num_layers)):
             layers.append(nn.Linear(in_dim, self.hidden_size))
             layers.append(nn.BatchNorm1d(self.hidden_size))
             layers.append(nn.ReLU(inplace=True))
@@ -90,19 +73,15 @@ class LittleMLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept either (batch, seq_len, input_size) or (batch, features)
         if x.dim() == 3:
             b, seq_len, feat = x.shape
             x = x.view(b, seq_len * feat)
         elif x.dim() == 1:
             x = x.unsqueeze(0)
-        elif x.dim() != 2:
-            raise ValueError(f"Unexpected input tensor shape: {x.shape}")
         return self.net(x.float())
 
     @staticmethod
     def _label_to_indices(y: torch.Tensor) -> torch.Tensor:
-        """Reversing one-hot encoding to class indices."""
         if y.dim() > 1 and y.size(1) > 1:
             return y.argmax(dim=1).long()
         return y.view(-1).long()
@@ -114,66 +93,46 @@ def make_dataloaders(data, batch_size, val_split=0.1, test_split=0.1):
     val_n = int(n * val_split)
     test_n = int(n * test_split)
     train_n = n - val_n - test_n
-    if train_n <= 0 or val_n <= 0 or test_n <= 0:
-        logging.error("Not enough samples for train/val/test splits: n=%s val_n=%s test_n=%s", n, val_n, test_n)
-        raise ValueError("Not enough samples for splits")
     train_ds, val_ds, test_ds = random_split(ds, [train_n, val_n, test_n])
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
-    test_loader = DataLoader(test_ds, batch_size=batch_size)
-    return train_loader, val_loader, test_loader
+    return (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True),
+        DataLoader(val_ds, batch_size=batch_size),
+        DataLoader(test_ds, batch_size=batch_size)
+    )
 
 
-@step
-def run_training(
-        epochs: int = TrainingConfig.max_epochs,
-        batch_size: int = TrainingConfig.batch_size,
-        lr: float = TrainingConfig.lr
-) -> Tuple[
-    Annotated[nn.Module, "trained_model"],
-    Annotated[List[Dict[str, Any]], "z_score_stats"]
-]:
-    """
-    Run training and return the model and stats as ZenML artifacts.
-    """
-    logging.info("Running training with epochs=%d, batch_size=%d, lr=%.6f", epochs, batch_size, lr)
 
-    # Run preprocessing (which populates the global Z_SCORE variable)
+def execute_training_logic():
+    epochs = TrainingConfig.max_epochs
+    batch_size = TrainingConfig.batch_size
+    lr = TrainingConfig.lr
+
+    logging.info("Running training logic...")
+
     data = preprocessing_pipeline_for_wisdm_raw_data()
-
-    # Retrieve the dictionary (Keys are tuples: (device, sensor))
     raw_stats_dict = get_z_score()
 
-    # Flatten the dictionary into a list of dicts for safe serialization (handling tuple keys)
-    serializable_stats: List[Dict[str, Any]] = []
-
+    serializable_stats = []
     if raw_stats_dict:
-        try:
-            for key_tuple, stats in raw_stats_dict.items():
-                # We assume key_tuple matches ['device', 'sensor'] based on preprocess logic
-                if isinstance(key_tuple, tuple) and len(key_tuple) >= 2:
-                    device, sensor = key_tuple[0], key_tuple[1]
-                else:
-                    # Fallback if single string key or unexpected structure
-                    device, sensor = str(key_tuple), "unknown"
+        for key_tuple, stats in raw_stats_dict.items():
+            device, sensor = (key_tuple[0], key_tuple[1]) if isinstance(key_tuple, tuple) else (str(key_tuple),
+                                                                                                "unknown")
+            serializable_stats.append({"device": device, "sensor": sensor, **stats})
 
-                record = {
-                    "device": device,
-                    "sensor": sensor,
-                    **stats
-                }
-                serializable_stats.append(record)
-            logging.info("Serialized z-score stats for %d groups.", len(serializable_stats))
-        except Exception as e:
-            logging.error("Failed to serialize z-score stats: %s", e)
-    else:
-        logging.warning("No z-score stats found after preprocessing.")
+    os.makedirs(os.path.dirname(STATS_PATH), exist_ok=True)
+
+    with open(STATS_PATH, 'w') as f:
+        json.dump(serializable_stats, f)
+    logging.info(f"Stats saved to {STATS_PATH}")
 
     train_loader, val_loader, _ = make_dataloaders(data, batch_size)
     input_size = data.width - len([col for col in data.columns if col.startswith("label")])
 
-    model = LittleMLP(input_size=input_size, hidden_size=TrainingConfig.hidden_size,
-                      num_layers=TrainingConfig.num_layers, num_classes=TrainingConfig.num_classes, lr=lr)
+    model = LittleMLP(input_size=input_size,
+                      hidden_size=TrainingConfig.hidden_size,
+                      num_layers=TrainingConfig.num_layers,
+                      num_classes=TrainingConfig.num_classes,
+                      lr=lr)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -181,11 +140,8 @@ def run_training(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_val_loss = float('inf')
-
     for epoch in range(1, epochs + 1):
         model.train()
-        train_losses = []
-
         for x_batch, y_batch in train_loader:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
@@ -194,9 +150,6 @@ def run_training(
             loss = criterion(logits, y_idx)
             loss.backward()
             optimizer.step()
-            train_losses.append(loss.item())
-
-        train_loss_avg = float(np.mean(train_losses))
 
         model.eval()
         val_losses = []
@@ -209,23 +162,12 @@ def run_training(
                 val_losses.append(loss.item())
 
         val_loss_avg = float(np.mean(val_losses)) if val_losses else float('inf')
-
-        logging.info(f"Epoch {epoch}/{epochs} train_loss={train_loss_avg:.4f} val_loss={val_loss_avg:.4f}")
-
-        if val_loss_avg < best_val_loss:
-            best_val_loss = val_loss_avg
+        logging.info(f"Epoch {epoch} Val Loss: {val_loss_avg:.4f}")
 
     model.to('cpu')
-    logging.info("Training completed. Best val_loss=%.4f", best_val_loss)
-
-    return model, serializable_stats
-
-
-@pipeline
-def training_pipeline():
-    logging.info("Starting Training Pipeline in main_training.py")
-    model, stats_dict = run_training()
+    torch.save(model, MODEL_PATH)
+    logging.info(f"Model saved to {MODEL_PATH}")
 
 
 if __name__ == "__main__":
-    training_pipeline()
+    execute_training_logic()

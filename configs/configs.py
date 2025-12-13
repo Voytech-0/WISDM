@@ -75,3 +75,4 @@ class TrainingConfig:
     # model directory and default checkpoint path
     model_dir: str = os.getenv('MODEL_DIR', str(project_root / 'models'))
     model_path: str = os.getenv('MODEL_PATH', str(project_root / 'models' / 'mlp.ckpt'))
+    stats_path: str = os.getenv('STATS_PATH', str(project_root / 'models' / 'processed' / 'z_score_params.json'))
