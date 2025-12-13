@@ -5,12 +5,10 @@ opentelemetry-api==1.28.2
 pandas==2.2.2
 polars==1.36.1
 pyarrow==22.0.0
-PyMySQL==1.0.3
+PyMySQL>=1.1.1
 python-dotenv==1.0.0
 requests==2.31.0
-SQLAlchemy==2.0.20
 prometheus_flask_exporter==0.22.0
 prometheus_client==0.17.0
-zenml>=0.92.0
+zenml[aim,local]>=0.92.0
 APScheduler==3.10.4
-aim==3.29.1

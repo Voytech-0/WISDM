@@ -16,7 +16,7 @@ from zenml.client import Client
 from zenml.exceptions import DoesNotExistException
 
 from daily_pipeline import daily_maintenance_pipeline
-from main_training import LittleMLP, training_pipeline
+from main_training import training_pipeline
 from preprocessing.preprocess import expand_raw_items_to_expanded_df
 from prometheus_flask_exporter import PrometheusMetrics
 from prometheus_client import Counter, Histogram
@@ -284,6 +284,28 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
         return jsonify({
             "status": "Training started",
             "message": "Check container logs or Aim dashboard for progress."
+        }), HTTPStatus.ACCEPTED
+
+    @app.route("/run_daily")
+    @metrics.do_not_track()
+    def run_daily_pipeline():
+        """the same `scheduled_job` function used by the APScheduler but run
+        it in a background thread so the HTTP request returns quickly.
+        """
+        def run_task():
+            try:
+                logging.info("Manual trigger: starting daily maintenance pipeline via API...")
+                scheduled_job()
+                logging.info("Manual trigger: daily maintenance pipeline finished.")
+            except Exception as e:
+                logging.error(f"Manual trigger: daily maintenance pipeline failed: {e}")
+
+        thread = threading.Thread(target=run_task)
+        thread.start()
+
+        return jsonify({
+            "status": "Daily pipeline started",
+            "message": "Pipeline is running in the background. Check logs for progress."
         }), HTTPStatus.ACCEPTED
 
     return app
