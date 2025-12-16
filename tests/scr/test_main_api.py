@@ -174,7 +174,7 @@ def test_modelLoader_load_caching(MockClient):
     mock_model_artifact.load.return_value = DummyModel()
     mock_run.steps.__getitem__.return_value.outputs = {
         "trained_model": mock_model_artifact,
-        "z_score_dict": MagicMock()  # stats
+        "z_score_dict": MagicMock()
     }
 
     loader = ModelLoader()

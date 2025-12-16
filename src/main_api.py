@@ -267,7 +267,7 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
             return "Model not loaded", HTTPStatus.SERVICE_UNAVAILABLE
         return "OK", HTTPStatus.OK
 
-    @app.route("/reload", methods=["POST"])
+    @app.route("/reload")
     def reload_model():
         try:
             model, stats = model_loader.load(force_reload=True)

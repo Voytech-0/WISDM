@@ -90,7 +90,6 @@ class LittleMLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept either (batch, seq_len, input_size) or (batch, features)
         if x.dim() == 3:
             b, seq_len, feat = x.shape
             x = x.view(b, seq_len * feat)

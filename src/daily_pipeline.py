@@ -21,10 +21,10 @@ def trigger_populate_db() -> bool:
 
 @step(enable_cache=False)
 def trigger_model_reload(_dep: Any = None) -> bool:
-    url = "http://localhost:8000/reload"
+    url = "http://app:8000/reload"
     try:
         logging.info(f"Triggering Model Reload at {url}...")
-        response = requests.post(url)
+        response = requests.get(url)
         response.raise_for_status()
         logging.info("Model reload successful.")
         return True

@@ -13,7 +13,6 @@ def integration_data():
         "feature_b": np.random.randn(50),
         "feature_c": np.random.randn(50),
         "feature_d": np.random.randn(50),
-        # One-hot encoded labels for 2 classes
         "label_0": [1, 0] * 25,
         "label_1": [0, 1] * 25
     }

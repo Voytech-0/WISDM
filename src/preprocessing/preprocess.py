@@ -220,6 +220,7 @@ def stats_from_z_score(z_score: Dict[tuple, Dict[str, float]], group_columns: Li
 
     return pl.DataFrame(data_rows).lazy()
 
+
 def apply_z_score_normalization(lf: pl.LazyFrame, z_score: dict = None, group_columns=None) -> pl.LazyFrame:
     """
     Normalize each axis (x,y,z) per device, sensor, participant using z-score.

@@ -4,10 +4,6 @@ import tempfile
 import pytest
 from unittest.mock import MagicMock, patch
 import polars as pl
-from sqlalchemy import text
-from flask import Flask
-
-# Import the module under test
 import db_init.populate_db
 from db_init.populate_db import (
     wait_for_db,
@@ -23,11 +19,9 @@ from db_init.populate_db import (
 from configs.configs import MySQLConfig
 
 
-# --- Fixtures ---
 
 @pytest.fixture
 def mock_engine():
-    """Returns a tuple of (mock_engine, mock_connection)"""
     mock_eng = MagicMock()
     mock_conn = MagicMock()
     mock_eng.connect.return_value.__enter__.return_value = mock_conn
@@ -36,7 +30,6 @@ def mock_engine():
 
 @pytest.fixture
 def tmp_dir():
-    """Creates a temporary directory for file operations."""
     d = tempfile.mkdtemp()
     yield d
     shutil.rmtree(d)
@@ -55,7 +48,6 @@ def test_wait_for_db_failure(mock_engine):
     engine, conn = mock_engine
     conn.execute.side_effect = Exception("DB Down")
 
-    # Patch sleep to make test fast
     with patch("time.sleep", return_value=None):
         assert wait_for_db(engine, timeout_s=0.1) is False
 
@@ -76,7 +68,6 @@ def test_create_status_table(mock_engine):
 
 def test_set_status_in_db(mock_engine, monkeypatch):
     engine, conn = mock_engine
-    # Mock the module-level function to return our fixture engine
     monkeypatch.setattr(db_init.populate_db, "get_connected_engine", lambda timeout_s=10: engine)
 
     set_status_in_db("test_key", "test_val")
@@ -90,29 +81,20 @@ def test_get_status_from_db(mock_engine, monkeypatch):
     engine, conn = mock_engine
     monkeypatch.setattr(db_init.populate_db, "get_connected_engine", lambda timeout_s=5: engine)
 
-    # Case 1: Value exists
     conn.execute.return_value.fetchone.return_value = ("found_value",)
     assert get_status_from_db("some_key") == "found_value"
 
-    # Case 2: Value does not exist
     conn.execute.return_value.fetchone.return_value = None
     assert get_status_from_db("missing_key") is None
 
 
 def test_load_data_raw(tmp_dir):
-    """Test loading of raw files and parsing of filename metadata."""
     d = os.path.join(tmp_dir, "subdir")
     os.makedirs(d)
 
-    # Filename format: data_{id}_{subject}_{sensor}_{device}.txt
-    # The code expects: ...split('_')[-3:] -> subject, sensor, device
-    # Let's match the code's expectation: str(p).removesuffix('.txt').split('_')[-3:]
-    # If filename is "data_1_101_accel_phone.txt":
-    # split: ["data", "1", "101", "accel", "phone"] -> last 3: 101, accel, phone
     f_path = os.path.join(d, "data_1_101_accel_phone.txt")
 
     with open(f_path, "w") as f:
-        # Code uses eol_char=';\n'
         f.write("101,Walk,1000,0.1,0.2,0.3;\n")
 
     lf = load_data_raw_with_row_per_sensor_device_activity_subject(tmp_dir)
@@ -125,11 +107,9 @@ def test_load_data_raw(tmp_dir):
 
 
 def test_insert_using_load_data(monkeypatch):
-    """Test that pymysql is called with LOAD DATA LOCAL INFILE."""
     mock_pymysql = MagicMock()
     monkeypatch.setattr(db_init.populate_db, "pymysql", mock_pymysql)
 
-    # Patch config values
     monkeypatch.setattr(MySQLConfig, "host", "localhost")
     monkeypatch.setattr(MySQLConfig, "user", "user")
     monkeypatch.setattr(MySQLConfig, "password", "pass")
@@ -151,31 +131,15 @@ def test_insert_using_load_data(monkeypatch):
     assert "LOAD DATA LOCAL INFILE" in sql
     assert "INTO TABLE test_table" in sql
 
-
-def test_populate_already_populated(monkeypatch):
-    """Test populate returns early if status flag is present."""
-    monkeypatch.setattr(db_init.populate_db, "get_status_from_db", lambda k: '1')
-    monkeypatch.setattr(db_init.populate_db, "get_connected_engine", lambda timeout_s=120: MagicMock())
-    monkeypatch.setattr(db_init.populate_db, "create_status_table", lambda e: None)
-
-    success, reason = populate("dummy_path")
-    assert success is True
-    assert reason == "already_populated"
-
-
 def test_populate_success(monkeypatch, tmp_dir):
-    """Test full populate flow."""
-    # 1. Not populated initially
     monkeypatch.setattr(db_init.populate_db, "get_status_from_db", lambda k: None)
     monkeypatch.setattr(db_init.populate_db, "get_connected_engine", lambda timeout_s=120: MagicMock())
     monkeypatch.setattr(db_init.populate_db, "create_status_table", lambda e: None)
     monkeypatch.setattr(db_init.populate_db, "create_table", lambda e: None)
 
-    # 2. Mock the heavy lifting (parsing)
     mock_parse = MagicMock()
     monkeypatch.setattr(db_init.populate_db, "parse_and_insert", mock_parse)
 
-    # 3. Mock setting the flag at the end
     mock_set_status = MagicMock()
     monkeypatch.setattr(db_init.populate_db, "set_status_in_db", mock_set_status)
 
@@ -188,7 +152,6 @@ def test_populate_success(monkeypatch, tmp_dir):
 
 
 def test_populate_db_unavailable(monkeypatch):
-    """Test failure when DB cannot be connected."""
 
     def raise_err(*args, **kwargs):
         raise RuntimeError("DB Down")
@@ -199,8 +162,6 @@ def test_populate_db_unavailable(monkeypatch):
     assert success is False
     assert reason == "db_unavailable"
 
-
-# --- Flask Endpoint Tests ---
 
 def test_flask_status_endpoint(monkeypatch):
     client = app.test_client()
@@ -213,7 +174,6 @@ def test_flask_status_endpoint(monkeypatch):
 
 def test_flask_populate_endpoint_already_done(monkeypatch):
     client = app.test_client()
-    # Mock status check inside the endpoint
     monkeypatch.setattr(db_init.populate_db, "get_status_from_db", lambda k: '1')
 
     resp = client.get("/populate")

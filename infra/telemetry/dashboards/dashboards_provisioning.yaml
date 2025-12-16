@@ -7,6 +7,5 @@ providers:
     disableDeletion: false
     updateIntervalSeconds: 10
     options:
-      # Change this to the directory Grafana can read from (e.g. /var/lib/grafana/dashboards)
       path: /var/lib/grafana/dashboards/wisdmdashboards
 

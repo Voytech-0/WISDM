@@ -19,7 +19,6 @@ sys.modules["main_training"] = MagicMock()
 from main_api import create_app, ModelLoader, InputPreparer
 import pytest
 import json
-import torch
 import torch.nn as nn
 
 
