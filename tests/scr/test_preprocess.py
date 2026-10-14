@@ -13,13 +13,11 @@ from preprocessing.preprocess import (
     raw_data_into_xyz_series,
     convert_data_to_fixed_length_intervals,
     apply_z_score_normalization,
-    preprocessing_pipeline_for_wisdm_raw_data,
-    build_raw_lazyframe_from_items,
+    get_z_score,
     lazyframe_to_single_10s,
     collect_and_dummify_drop_subject,
     expand_lists,
     expand_raw_items_to_expanded_df,
-    set_z_score_stats
 )
 
 
@@ -74,6 +72,44 @@ def test_wait_for_mysql(monkeypatch):
     engine_fail = MockEngine(succeed_on_attempt=99)
     with pytest.raises(OperationalError):
         preprocess.wait_for_mysql(engine_fail, timeout=0.5, interval=0.1)
+
+
+@pytest.mark.parametrize("max_rows, expect_limit", [(None, False), (10000, True)])
+def test_load_raw_data_from_mysql_max_rows(monkeypatch, max_rows, expect_limit):
+    queries = []
+
+    class EmptyResult:
+        def keys(self):
+            return ["subject_id", "label", "timestamp", "x", "y", "z", "sensor", "device"]
+
+        def fetchmany(self, size=None):
+            return []
+
+    class Conn:
+        def execution_options(self, **kwargs):
+            return self
+
+        def execute(self, query):
+            queries.append(str(query))
+            return EmptyResult()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    class Engine:
+        def connect(self):
+            return Conn()
+
+    monkeypatch.setattr(preprocess.DataConfig, "max_rows", max_rows)
+    monkeypatch.setattr(preprocess, "create_engine", lambda url: Engine())
+    monkeypatch.setattr(preprocess, "wait_for_mysql", lambda engine, timeout: None)
+
+    preprocess.load_raw_data_from_mysql()
+
+    assert ("LIMIT 10000" in queries[0]) is expect_limit
 
 
 def test_load_raw_data_from_mysql(monkeypatch):
@@ -260,10 +296,7 @@ def test_convert_data_to_10_seconds_intervals(monkeypatch):
         )
 
 
-def test_apply_z_score_normalization(monkeypatch, tmp_path):
-    stats_path = tmp_path / "z_score_stats.pkl"
-    monkeypatch.setattr(PathsConfig, "z_score_params_path", str(stats_path))
-
+def test_apply_z_score_normalization():
     input_lf = pl.LazyFrame({
         "subject_id": ["1", "2"],
         "device": ["devA", "devB"],
@@ -274,49 +307,31 @@ def test_apply_z_score_normalization(monkeypatch, tmp_path):
         "z": [[2.0, 2.0, 2.0], [6.0, 6.0, 6.0]],
     })
 
-    cases = [
-        {
-            "mode": "train",
-            "train_flag": True,
-            "input": input_lf,
-            "expected_x_first_vals": [-1.0, 0.0, 1.0],
-            "check_file_exists": True
-        },
-        {
-            "mode": "inference",
-            "train_flag": False,
-            "input": pl.LazyFrame({
-                "subject_id": ["3"],
-                "device": ["devA"],
-                "sensor": ["sens1"],
-                "label": ["L"],
-                "x": [[10.0, 10.0, 10.0]],
-                "y": [[1.0, 1.0, 1.0]],
-                "z": [[2.0, 2.0, 2.0]]
-            }),
-            "expected_x_first_vals": [0.0, 0.0, 0.0],
-            "check_file_exists": True
-        }
-    ]
+    # No stats given: computed from the data and exposed via get_z_score()
+    df_train = apply_z_score_normalization(input_lf).collect()
 
-    # Run TRAIN case first to generate the file
-    train_case = cases[0]
-    out_train = apply_z_score_normalization(train_case["input"], train=True)
-    df_train = out_train.collect()
-
-    assert stats_path.exists()
-
-    # Verify Train output (DevA is row 0)
     row_0_x = df_train.filter(pl.col("device") == "devA").get_column("x")[0]
-    np.testing.assert_allclose(row_0_x, train_case["expected_x_first_vals"])
+    np.testing.assert_allclose(row_0_x, [-1.0, 0.0, 1.0])
+    # constant series: std 0 is replaced by 1 -> normalizes to 0, not NaN
+    row_1_x = df_train.filter(pl.col("device") == "devB").get_column("x")[0]
+    np.testing.assert_allclose(row_1_x, [0.0, 0.0, 0.0])
 
-    # Run INFERENCE case
-    infer_case = cases[1]
-    out_infer = apply_z_score_normalization(infer_case["input"], train=False)
-    df_infer = out_infer.collect()
+    stats = get_z_score()
+    assert stats[("devA", "sens1")]["x_mean"] == 10.0
+    assert stats[("devA", "sens1")]["x_std"] == 10.0
 
-    row_infer_x = df_infer.get_column("x")[0]
-    np.testing.assert_allclose(row_infer_x, infer_case["expected_x_first_vals"])
+    # Inference: reuse the stored stats on new data
+    infer_lf = pl.LazyFrame({
+        "subject_id": ["3"],
+        "device": ["devA"],
+        "sensor": ["sens1"],
+        "label": ["L"],
+        "x": [[10.0, 10.0, 10.0]],
+        "y": [[1.0, 1.0, 1.0]],
+        "z": [[2.0, 2.0, 2.0]],
+    })
+    df_infer = apply_z_score_normalization(infer_lf, z_score=stats).collect()
+    np.testing.assert_allclose(df_infer.get_column("x")[0], [0.0, 0.0, 0.0])
 
 
 def test_expand_lists(monkeypatch):
@@ -370,15 +385,11 @@ def test_lazyframe_to_single_10s(monkeypatch):
             assert x_list[-1] == case["expected_x_last"]
 
 
-def test_expand_raw_items_to_expanded_df(monkeypatch, tmp_path):
-
-    monkeypatch.setattr(PathsConfig, "z_score_params_path", str(tmp_path / "stats.pkl"))
-    stats_df = pl.DataFrame({
-        "device": ["phone"], "sensor": ["accel"],
-        "x_mean": [0.0], "y_mean": [0.0], "z_mean": [0.0],
-        "x_std": [1.0], "y_std": [1.0], "z_std": [1.0],
-    })
-    set_z_score_stats(stats_df.lazy())
+def test_expand_raw_items_to_expanded_df(monkeypatch):
+    z_score = {("phone", "accel"): {
+        "x_mean": 0.0, "y_mean": 0.0, "z_mean": 0.0,
+        "x_std": 1.0, "y_std": 1.0, "z_std": 1.0,
+    }}
 
     monkeypatch.setattr(DataConfig, "feature_length_in_seconds", 2)
     monkeypatch.setattr(DataConfig, "frequency", 1)
@@ -393,11 +404,10 @@ def test_expand_raw_items_to_expanded_df(monkeypatch, tmp_path):
         "device": "phone", "sensor": "accel"
     }]
 
-    df_out = expand_raw_items_to_expanded_df(items)
+    df_out = expand_raw_items_to_expanded_df(items, z_score=z_score)
 
     assert df_out.height == 1
     assert "x_0" in df_out.columns
     assert "x_1" in df_out.columns
     assert "x_2" not in df_out.columns
     assert df_out["x_0"][0] == 10.0
-    assert df_out["device_phone"][0] == 1

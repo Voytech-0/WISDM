@@ -1,23 +1,21 @@
 services:
 
   app:
-
-#    build:
-#      context: ..
-#      dockerfile: infra/build/Dockerfile
+    build:
+      context: ..
+      dockerfile: infra/build/Dockerfile
     image: wisdm:latest
-    command: python src/main_api.py serve 8000
+    command: python src/main_api.py
     ports:
       - "8000:8000"
     env_file:
       - ../.env
-    volumes:
-      - app:/app
 
     depends_on:
       db-init:
-        condition: service_started # here we do not wait for full population of mysql.
-
+        condition: service_started
+    volumes:
+      - models:/app/models
     healthcheck:
       test: ["CMD-SHELL", "curl --fail http://localhost:8000/health || exit 1"]
       interval: 5s
@@ -44,25 +42,6 @@ services:
       - "9091:9091"
     healthcheck:
       test: wget http://localhost:9091/metrics -S -O - || exit 1
-      retries: 3
-      interval: 5s
-
-  airflow:
-    image: apache/airflow:3.1.0-python3.10
-    command: airflow standalone
-    ports:
-      - "4242:8080"  # note: We need to use a different port than 8080 as it is already assigned for mlflow.
-    environment:
-      - _AIRFLOW_DB_MIGRATE=true
-      - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=true  # note: Disabling authentication completely.
-    env_file:
-      - ../.env
-    volumes:
-      - ./airflow/dags/:/opt/airflow/dags  # note: Normally you pass DAGs to Airflow in a different way, through CI. Like moving to a Cloud Storage Directory where Airflow is getting the DAGs from.
-      - /var/run/docker.sock:/var/run/docker.sock  # note: For local deployment: linking local docker to Airflow
-      - app:/app
-    healthcheck:
-      test: wget http://localhost:8080/api/v2/monitor/health -o /dev/null || exit 1  # note: wget downloads the file. I do not need it. So we move it to /dev/null
       retries: 3
       interval: 5s
 
@@ -121,6 +100,26 @@ services:
       interval: 10s
       retries: 5
 
+
+  airflow:
+    image: apache/airflow:3.1.0-python3.10
+    command: airflow standalone
+    ports:
+      - "4242:8080"  # note: We need to use a different port than 8080 as it is already assigned for mlflow.
+    environment:
+      - _AIRFLOW_DB_MIGRATE=true
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false  # note: otherwise the daily schedule never fires without a manual unpause.
+      - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=true  # note: Disabling authentication completely.
+    env_file:
+      - ../.env
+    volumes:
+      - ./airflow/dags/:/opt/airflow/dags  # note: Normally you pass DAGs to Airflow in a different way, through CI. Like moving to a Cloud Storage Directory where Airflow is getting the DAGs from.
+      - /var/run/docker.sock:/var/run/docker.sock  # note: For local deployment: linking local docker to Airflow
+    healthcheck:
+      test: wget http://localhost:8080/api/v2/monitor/health -o /dev/null || exit 1  # note: wget downloads the file. I do not need it. So we move it to /dev/null
+      retries: 3
+      interval: 5s
+
 volumes:
   mysql_data:
-  app:
+  models:

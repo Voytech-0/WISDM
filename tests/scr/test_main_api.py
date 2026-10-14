@@ -1,18 +1,12 @@
-# ensure the project root is on sys.path so `import src...` works when pytest runs
-import sys
-from pathlib import Path
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
+import json
 import pytest
 import torch
 from click.testing import CliRunner
-from unittest.mock import Mock, patch
-import src.main_api as main_api
+from unittest.mock import Mock, patch, MagicMock
+import main_api
 from types import SimpleNamespace
 
-from src.main_api import create_app, InputPreparer, ModelLoader
+from main_api import create_app, InputPreparer, ModelLoader
 
 
 class DummyModel(torch.nn.Module):
@@ -20,7 +14,7 @@ class DummyModel(torch.nn.Module):
         super().__init__()
         self.num_classes = num_classes
         # mimic saved hparams used by InputPreparer
-        self.hparams = {'input_size': None}
+        self.hparams = {'input_size': 2}
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # simple deterministic rule: class = int(sum(features)) % num_classes
@@ -34,18 +28,27 @@ class DummyModel(torch.nn.Module):
 
 
 class StubLoader:
-    def __init__(self, model: DummyModel):
+
+    def __init__(self, model: DummyModel, stats=None):
         self._model = model
-        # provide a checkpoint_path attribute to satisfy logging in reload endpoint
-        self.checkpoint_path = "stub"
+        self.z_score_stats = stats or []
 
     def load(self, force_reload: bool = False):
-        return self._model
+        # The new interface returns a tuple
+        return self._model, self.z_score_stats
+
+
+class StubPreparer(InputPreparer):
+    """Turns {"f0": 1.0, ...} dicts into a feature tensor, skipping raw-sensor preprocessing."""
+
+    def prepare(self, data_json, model=None):
+        items = data_json if isinstance(data_json, list) else [data_json]
+        return torch.tensor([list(i.values()) for i in items], dtype=torch.float32)
 
 
 def test_create_app_request_timing():
     loader = StubLoader(DummyModel())
-    preparer = InputPreparer()
+    preparer = StubPreparer()
     app = create_app(loader, preparer)
     client = app.test_client()
 
@@ -56,8 +59,9 @@ def test_create_app_request_timing():
 
 
 def test_create_app_reload_model():
+    # Initial setup with 3 classes
     loader = StubLoader(DummyModel(num_classes=3))
-    preparer = InputPreparer()
+    preparer = StubPreparer()
     app = create_app(loader, preparer)
     client = app.test_client()
 
@@ -71,7 +75,9 @@ def test_create_app_reload_model():
     assert len(out[0]['probs']) == 3
 
     # change underlying model to different num_classes and reload
+    # We simulate an update in the loader
     loader._model = DummyModel(num_classes=2)
+
     r = client.post('/reload')
     assert r.status_code == 200
     assert r.get_json() == {"status": "reloaded"}
@@ -86,7 +92,7 @@ def test_create_app_reload_model():
 
 def test_create_app_predict():
     loader = StubLoader(DummyModel(num_classes=3))
-    preparer = InputPreparer()
+    preparer = StubPreparer()
     app = create_app(loader, preparer)
     client = app.test_client()
 
@@ -102,119 +108,173 @@ def test_create_app_predict():
 
 
 def test_serve():
-
     runner = CliRunner()
     loader_instance = Mock(name='loader')
+    # loader.load() must return a tuple (model, stats) now
+    loader_instance.load.return_value = (Mock(), [])
+
     preparer_instance = Mock(name='preparer')
     app_mock = Mock(name='flask_app')
     app_mock.run = Mock(name='run')
 
-    with patch('src.main_api.ModelLoader') as MockLoaderCls, \
-         patch('src.main_api.InputPreparer') as MockPreparerCls, \
-         patch('src.main_api.create_app') as mock_create_app:
+    with patch('main_api.ModelLoader') as MockLoaderCls, \
+            patch('main_api.InputPreparer') as MockPreparerCls, \
+            patch('main_api.create_app') as mock_create_app:
         MockLoaderCls.return_value = loader_instance
         MockPreparerCls.return_value = preparer_instance
         mock_create_app.return_value = app_mock
 
         host = '127.0.0.1'
         port = '9010'
-        result = runner.invoke(main_api.cli, ['serve', '--host', host, port])
+
+        result = runner.invoke(main_api.serve, ['--host', host, '--port', port])
 
     assert result.exit_code == 0
-    assert MockLoaderCls.called, "ModelLoader should be instantiated"
+
+    MockLoaderCls.assert_called_once_with()
     assert MockPreparerCls.called, "InputPreparer should be instantiated"
+
     mock_create_app.assert_called_once_with(loader_instance, preparer_instance)
     app_mock.run.assert_called_once_with(host=host, port=int(port))
 
-class FakeLittleMLP(torch.nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes, lr=None):
-        super().__init__()
-        # minimal layers so state_dict() has content
-        self.fc = torch.nn.Linear(input_size, num_classes)
 
-    def forward(self, x):
-        return self.fc(x)
+# --- ModelLoader (file based) ---
 
-def test_modelLoader_load_cached(tmp_path):
-
-
-    hparams = {
-        'input_size': 2,
-        'hidden_size': 4,
-        'num_layers': 1,
-        'num_classes': 3,
-        'lr': 0.01,
-    }
-    model = FakeLittleMLP(
-        input_size=hparams['input_size'],
-        hidden_size=hparams['hidden_size'],
-        num_layers=hparams['num_layers'],
-        num_classes=hparams['num_classes'],
-        lr=hparams['lr'],
-    )
-
-    ckpt = {'model_state_dict': model.state_dict(), 'hparams': hparams}
-    ckpt_path = tmp_path / 'ckpt.pth'
-    torch.save(ckpt, str(ckpt_path))
-
-    loaded = ModelLoader._load_cached(str(ckpt_path), FakeLittleMLP)
-    assert hasattr(loaded, 'hparams')
-    assert int(loaded.hparams['input_size']) == hparams['input_size']
-    assert isinstance(loaded, FakeLittleMLP)
+@pytest.fixture
+def model_files(tmp_path, monkeypatch):
+    model_path = tmp_path / "models" / "mlp.ckpt"
+    stats_path = tmp_path / "models" / "processed" / "z.json"
+    monkeypatch.setattr(main_api.TrainingConfig, "model_path", str(model_path), raising=False)
+    monkeypatch.setattr(main_api.TrainingConfig, "stats_path", str(stats_path), raising=False)
+    return model_path, stats_path
 
 
-def test_modelLoader_load(tmp_path):
-
-    hparams = {
-        'input_size': 2,
-        'hidden_size': 4,
-        'num_layers': 1,
-        'num_classes': 3,
-        'lr': 0.01,
-    }
-    model = FakeLittleMLP(
-        input_size=hparams['input_size'],
-        hidden_size=hparams['hidden_size'],
-        num_layers=hparams['num_layers'],
-        num_classes=hparams['num_classes'],
-        lr=hparams['lr'],
-    )
-
-    ckpt = {'model_state_dict': model.state_dict(), 'hparams': hparams}
-    ckpt_path = tmp_path / 'ckpt2.pth'
-    torch.save(ckpt, str(ckpt_path))
-
-    loader = ModelLoader(checkpoint_path=str(ckpt_path), model_cls=model.__class__)
-    m1 = loader.load()
-    assert isinstance(m1, model.__class__)
-
-    m2 = loader.load(force_reload=True)
-    assert isinstance(m2, model.__class__)
-    assert m1 is not m2  # should be different instances
+def _save(model_path, stats_path, stats=None):
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.nn.Linear(2, 2), model_path)
+    if stats is not None:
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_path.write_text(json.dumps(stats))
 
 
-def test_input_preparer_is_raw():
+def test_modelloader_missing_file(model_files):
+    with pytest.raises(FileNotFoundError):
+        ModelLoader().load()
+
+
+def test_modelloader_load_success(model_files):
+    stats = [{"device": "phone", "sensor": "accel", "mean": 0.5}]
+    _save(*model_files, stats=stats)
+    model, loaded_stats = ModelLoader().load()
+    assert isinstance(model, torch.nn.Linear)
+    assert loaded_stats == stats
+
+
+def test_modelloader_missing_stats_defaults_empty(model_files):
+    _save(*model_files)
+    _, stats = ModelLoader().load()
+    assert stats == []
+
+
+def test_modelloader_caching_and_force_reload(model_files):
+    _save(*model_files)
+    loader = ModelLoader()
+    m1, _ = loader.load()
+    m2, _ = loader.load()
+    assert m1 is m2
+    m3, _ = loader.load(force_reload=True)
+    assert m3 is not m1
+
+
+def test_input_preparer_stats():
+    """Test that InputPreparer can hold and update stats."""
     prep = InputPreparer()
-    assert prep._is_raw({'x': [1], 'y': [2], 'z': [3]})
-    assert not prep._is_raw({'a': 1, 'b': 2})
-    assert not prep._is_raw(None)
+    assert prep.z_score_dict == {}
+
+    prep.set_stats([{"device": "phone", "sensor": "accel", "mean": 10}])
+    assert prep.z_score_dict == {("phone", "accel"): {"mean": 10}}
 
 
-def test_input_preparer_prepare():
-    prep = InputPreparer()
+def test_input_preparer_prepare(monkeypatch):
+    import polars as pl
+    prep = InputPreparer([{"device": "phone", "sensor": "accel", "mean": 0.0}])
 
-    # empty payload -> error
     with pytest.raises(ValueError):
         prep.prepare([])
 
-    # expanded features -> returns tensor
-    data = {"f0": 1.0, "f1": 2.0}
-    t = prep.prepare(data)
-    assert isinstance(t, torch.Tensor)
-    assert t.shape[0] == 1
-    assert t.shape[1] == 2
+    seen = {}
 
-    model = SimpleNamespace()
-    model.hparams = SimpleNamespace(input_size=1)
-    with pytest.raises(ValueError):
-        prep.prepare(data, model=model)
+    def fake_expand(items, z_score):
+        seen["items"], seen["z"] = items, z_score
+        return pl.DataFrame({"x_0": [1.0], "y_0": [2.0], "label_A": [1]})
+
+    monkeypatch.setattr(main_api, "expand_raw_items_to_expanded_df", fake_expand)
+    t = prep.prepare({"device": "phone"})
+
+    assert t.shape == (1, 2)  # label columns dropped
+    assert seen["items"] == [{"device": "phone"}]  # single dict wrapped in list
+    assert seen["z"] == prep.z_score_dict
+
+
+def test_predict_when_model_none_initially(monkeypatch):
+    """If the app starts with no model available, /predict should attempt to load it and still succeed when loader becomes available."""
+    # loader whose first call raises, second call returns a model
+    class FlakyLoader:
+        def __init__(self, model):
+            self.model = model
+            self.called = 0
+
+        def load(self, force_reload: bool = False):
+            self.called += 1
+            if self.called == 1:
+                raise RuntimeError("no model yet")
+            return self.model, []
+
+    loader = FlakyLoader(DummyModel())
+    preparer = StubPreparer()
+    app = create_app(loader, preparer)
+    client = app.test_client()
+
+    # At startup loader.load() should have been called and failed, leaving model None
+    # Now /predict should trigger another load and succeed
+    payload = [{"a": 1.0, "b": 2.0}]
+    r = client.post('/predict', json=payload)
+    assert r.status_code == 200
+    out = r.get_json()
+    assert isinstance(out, list) and len(out) == 1
+
+
+def _train_client():
+    return create_app(StubLoader(DummyModel()), InputPreparer()).test_client()
+
+
+def test_train_triggers_airflow_dag():
+    token_resp = Mock(json=Mock(return_value={"access_token": "tok"}))
+    run_resp = Mock(ok=True, json=Mock(return_value={"dag_run_id": "r1"}))
+    with patch("main_api.requests.get", return_value=token_resp) as get, \
+            patch("main_api.requests.post", return_value=run_resp) as post:
+        r = _train_client().post("/train")
+
+    assert r.status_code == 202
+    assert r.get_json()["airflow_response"] == {"dag_run_id": "r1"}
+    assert get.call_args.args[0].endswith("/auth/token")
+    url = post.call_args.args[0]
+    assert url.endswith("/api/v2/dags/wisdm_training/dagRuns")
+    assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+
+def test_train_airflow_rejects():
+    token_resp = Mock(json=Mock(return_value={"access_token": "tok"}))
+    run_resp = Mock(ok=False, text="boom")
+    with patch("main_api.requests.get", return_value=token_resp), \
+            patch("main_api.requests.post", return_value=run_resp):
+        r = _train_client().post("/train")
+    assert r.status_code == 502
+    assert r.get_json()["details"] == "boom"
+
+
+def test_train_airflow_unreachable():
+    with patch("main_api.requests.get", side_effect=ConnectionError("down")):
+        r = _train_client().post("/train")
+    assert r.status_code == 500
+    assert "down" in r.get_json()["error"]

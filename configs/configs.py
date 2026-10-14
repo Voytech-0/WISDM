@@ -45,6 +45,8 @@ class DataConfig:
     frequency: int = 20
     feature_length_in_seconds: int = 10
     db_connect_timeout: int = 30
+    # optional cap on rows read from MySQL for training (quick local runs); unset = all rows
+    max_rows: int | None = int(os.getenv('MAX_ROWS') or 0) or None
     data_path_prefix: str = "data/wisdm-dataset/raw"
     possible_devices: list[str] = ("phone", "watch")
     possible_sensors: list[str] = ("accel", "gyro")
@@ -75,3 +77,4 @@ class TrainingConfig:
     # model directory and default checkpoint path
     model_dir: str = os.getenv('MODEL_DIR', str(project_root / 'models'))
     model_path: str = os.getenv('MODEL_PATH', str(project_root / 'models' / 'mlp.ckpt'))
+    stats_path: str = os.getenv('STATS_PATH', str(project_root / 'models' / 'processed' / 'z_score_params.json'))
