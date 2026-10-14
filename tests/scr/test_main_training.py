@@ -1,4 +1,4 @@
-import sys
+import json
 import pytest
 import torch
 import polars as pl
@@ -9,37 +9,9 @@ from unittest.mock import MagicMock
 # --- Fixtures ---
 
 @pytest.fixture
-def mock_zenml(monkeypatch):
-
-    def identity_decorator(*args, **kwargs):
-        def wrapper(func):
-            return func
-
-        if len(args) == 1 and callable(args[0]):
-            return args[0]
-        return wrapper
-
-    mock_zenml = MagicMock()
-    mock_zenml.step = identity_decorator
-    mock_zenml.pipeline = identity_decorator
-
-    monkeypatch.setitem(sys.modules, "zenml", mock_zenml)
-
-
-    return mock_zenml
-
-
-@pytest.fixture
-def main_training_module(mock_zenml):
-
-    if "main_training" in sys.modules:
-        import main_training
-        import importlib
-        importlib.reload(main_training)
-        return main_training
-    else:
-        import main_training
-        return main_training
+def main_training_module():
+    import main_training
+    return main_training
 
 
 @pytest.fixture
@@ -53,23 +25,6 @@ def sample_dataframe():
         "label_2": [0, 0, 1, 1, 0],
     }
     return pl.DataFrame(data)
-
-
-@pytest.fixture
-def mock_config(monkeypatch, main_training_module):
-
-    class MockConfig:
-        seed = 44
-        max_epochs = 1
-        batch_size = 2
-        lr = 0.001
-        hidden_size = 8
-        num_layers = 1
-        num_classes = 3
-
-    monkeypatch.setattr(main_training_module, "TrainingConfig", MockConfig)
-    return MockConfig
-
 
 
 def test_sequence_dataset_init_success(main_training_module, sample_dataframe):
@@ -124,41 +79,22 @@ def test_make_dataloaders(main_training_module):
     assert len(test_dl.dataset) == 20
 
 
-def test_run_training_step_success(
-        monkeypatch,
-        main_training_module,
-        mock_config,
-        sample_dataframe
-):
+def test_execute_training_logic_saves_model_and_stats(monkeypatch, tmp_path, main_training_module, sample_dataframe):
+    mt = main_training_module
+    model_path = tmp_path / "models" / "mlp.ckpt"
+    stats_path = tmp_path / "models" / "processed" / "z.json"
 
-    large_df = pl.concat([sample_dataframe] * 10)
-    mock_pipeline = MagicMock(return_value=large_df)
-    monkeypatch.setattr(main_training_module, "preprocessing_pipeline_for_wisdm_raw_data", mock_pipeline)
+    monkeypatch.setattr(mt, "MODEL_PATH", str(model_path))
+    monkeypatch.setattr(mt, "STATS_PATH", str(stats_path))
+    for k, v in dict(max_epochs=1, batch_size=4, lr=0.01, hidden_size=8, num_layers=1, num_classes=3).items():
+        monkeypatch.setattr(mt.TrainingConfig, k, v)
+    monkeypatch.setattr(mt, "preprocessing_pipeline_for_wisdm_raw_data",
+                        MagicMock(return_value=pl.concat([sample_dataframe] * 10)))
+    monkeypatch.setattr(mt, "get_z_score",
+                        MagicMock(return_value={("phone", "accel"): {"mean": 0.5, "std": 1.0}}))
 
-    mock_lf = MagicMock()
-    mock_lf.collect.return_value.to_dicts.return_value = [{"mean": 0.5}]
-    mock_get_z_score = MagicMock(return_value=mock_lf)
-    monkeypatch.setattr(main_training_module, "get_z_score", mock_get_z_score)
+    mt.execute_training_logic()
 
-    model, stats = main_training_module.run_training(epochs=1, batch_size=4, lr=0.01)
-
-    assert isinstance(model, main_training_module.LittleMLP)
-    assert stats == [{"mean": 0.5}]
-
-
-def test_run_training_step_failure(
-        monkeypatch,
-        main_training_module,
-        mock_zenml,
-        sample_dataframe
-):
-
-    large_df = pl.concat([sample_dataframe] * 10)
-    mock_pipeline = MagicMock(return_value=large_df)
-    monkeypatch.setattr(main_training_module, "preprocessing_pipeline_for_wisdm_raw_data", mock_pipeline)
-
-    # Should not raise exception
-    model, stats = main_training_module.run_training(epochs=1, batch_size=4)
-
-    assert isinstance(model, main_training_module.LittleMLP)
-    mock_pipeline.assert_called_once()
+    assert json.loads(stats_path.read_text()) == [{"device": "phone", "sensor": "accel", "mean": 0.5, "std": 1.0}]
+    model = torch.load(model_path, weights_only=False)
+    assert isinstance(model, mt.LittleMLP)

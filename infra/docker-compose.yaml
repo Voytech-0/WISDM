@@ -1,8 +1,11 @@
 services:
 
   app:
+    build:
+      context: ..
+      dockerfile: infra/build/Dockerfile
     image: wisdm:latest
-    command: python src/main_api.py serve
+    command: python src/main_api.py
     ports:
       - "8000:8000"
     env_file:
@@ -11,10 +14,8 @@ services:
     depends_on:
       db-init:
         condition: service_started
-      airflow:
-        condition: service_started
     volumes:
-      - ./zenml_artifacts:/root/.config/zenml
+      - models:/app/models
     healthcheck:
       test: ["CMD-SHELL", "curl --fail http://localhost:8000/health || exit 1"]
       interval: 5s
@@ -107,6 +108,7 @@ services:
       - "4242:8080"  # note: We need to use a different port than 8080 as it is already assigned for mlflow.
     environment:
       - _AIRFLOW_DB_MIGRATE=true
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false  # note: otherwise the daily schedule never fires without a manual unpause.
       - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=true  # note: Disabling authentication completely.
     env_file:
       - ../.env
@@ -120,4 +122,4 @@ services:
 
 volumes:
   mysql_data:
-  zenml_server_data:
+  models:

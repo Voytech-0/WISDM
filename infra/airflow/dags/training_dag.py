@@ -1,3 +1,5 @@
+import os
+
 from airflow import DAG
 from airflow.providers.docker.operators.docker import DockerOperator
 from docker.types import Mount
@@ -15,7 +17,7 @@ default_args = {
 dag = DAG(
     "wisdm_training",
     default_args=default_args,
-    description="Daily training pipeline migrating from ZenML",
+    description="Daily training pipeline",
     schedule="59 23 * * *",
     start_date=datetime(2023, 1, 1),
     catchup=False
@@ -25,7 +27,7 @@ perhaps_populate_task = DockerOperator(
     docker_url="unix://var/run/docker.sock",
     image="curlimages/curl:8.4.0",
     command=(
-        "sh -c 'set -euo pipefail; "
+        "sh -c 'set -eu; "
         "code=$(curl -sS -o /dev/null -w \"%{http_code}\" http://db-init:5001/populate || true); "
         "if [ \"$code\" = \"200\" ] || [ \"$code\" = \"409\" ]; then "
         "echo \"populate returned $code\"; exit 0; "
@@ -39,7 +41,7 @@ perhaps_populate_task = DockerOperator(
 
 model_training_task = DockerOperator(
     docker_url="unix://var/run/docker.sock",
-    command="python src/main_training.py train",
+    command="python src/main_training.py",
     image="wisdm:latest",
     network_mode="infra_default",
     mount_tmp_dir=False,
@@ -49,8 +51,9 @@ model_training_task = DockerOperator(
         "MYSQL_USER": "user",
         "MYSQL_PASSWORD": "password",
         "MYSQL_DATABASE": "wisdm",
+        "MAX_ROWS": os.getenv("MAX_ROWS", ""),  # note: set e.g. MAX_ROWS=10000 in .env for a quick run on a subset
     },
-    mounts=[Mount(target="/app", source="infra_app", type="volume")],
+    mounts=[Mount(target="/app/models", source="infra_models", type="volume")],
     task_id="training",
     dag=dag,
 )

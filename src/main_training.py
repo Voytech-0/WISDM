@@ -14,7 +14,7 @@ from preprocessing.preprocess import preprocessing_pipeline_for_wisdm_raw_data, 
 
 logging.basicConfig(level=logging.INFO)
 
-MODEL_PATH = TrainingConfig.TrainingConfig
+MODEL_PATH = TrainingConfig.model_path
 STATS_PATH = TrainingConfig.stats_path
 
 seed_val = TrainingConfig.seed
@@ -165,6 +165,7 @@ def execute_training_logic():
         logging.info(f"Epoch {epoch} Val Loss: {val_loss_avg:.4f}")
 
     model.to('cpu')
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     torch.save(model, MODEL_PATH)
     logging.info(f"Model saved to {MODEL_PATH}")
 

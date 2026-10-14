@@ -1,19 +1,12 @@
-# ensure the project root is on sys.path so `import src...` works when pytest runs
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
+import json
 import pytest
 import torch
 from click.testing import CliRunner
 from unittest.mock import Mock, patch, MagicMock
-import src.main_api as main_api
+import main_api
 from types import SimpleNamespace
 
-from src.main_api import create_app, InputPreparer, ModelLoader
+from main_api import create_app, InputPreparer, ModelLoader
 
 
 class DummyModel(torch.nn.Module):
@@ -45,9 +38,17 @@ class StubLoader:
         return self._model, self.z_score_stats
 
 
+class StubPreparer(InputPreparer):
+    """Turns {"f0": 1.0, ...} dicts into a feature tensor, skipping raw-sensor preprocessing."""
+
+    def prepare(self, data_json, model=None):
+        items = data_json if isinstance(data_json, list) else [data_json]
+        return torch.tensor([list(i.values()) for i in items], dtype=torch.float32)
+
+
 def test_create_app_request_timing():
     loader = StubLoader(DummyModel())
-    preparer = InputPreparer()
+    preparer = StubPreparer()
     app = create_app(loader, preparer)
     client = app.test_client()
 
@@ -60,7 +61,7 @@ def test_create_app_request_timing():
 def test_create_app_reload_model():
     # Initial setup with 3 classes
     loader = StubLoader(DummyModel(num_classes=3))
-    preparer = InputPreparer()
+    preparer = StubPreparer()
     app = create_app(loader, preparer)
     client = app.test_client()
 
@@ -91,7 +92,7 @@ def test_create_app_reload_model():
 
 def test_create_app_predict():
     loader = StubLoader(DummyModel(num_classes=3))
-    preparer = InputPreparer()
+    preparer = StubPreparer()
     app = create_app(loader, preparer)
     client = app.test_client()
 
@@ -116,149 +117,103 @@ def test_serve():
     app_mock = Mock(name='flask_app')
     app_mock.run = Mock(name='run')
 
-    with patch('src.main_api.ModelLoader') as MockLoaderCls, \
-            patch('src.main_api.InputPreparer') as MockPreparerCls, \
-            patch('src.main_api.create_app') as mock_create_app:
+    with patch('main_api.ModelLoader') as MockLoaderCls, \
+            patch('main_api.InputPreparer') as MockPreparerCls, \
+            patch('main_api.create_app') as mock_create_app:
         MockLoaderCls.return_value = loader_instance
         MockPreparerCls.return_value = preparer_instance
         mock_create_app.return_value = app_mock
 
         host = '127.0.0.1'
         port = '9010'
-        pipeline_name = "my_training_pipeline"
 
-        # Test that CLI accepts the new --pipeline argument
-        result = runner.invoke(main_api.cli, ['serve', '--host', host, '--port', port, '--pipeline', pipeline_name])
+        result = runner.invoke(main_api.serve, ['--host', host, '--port', port])
 
     assert result.exit_code == 0
 
-    # Check that ModelLoader was initialized with the pipeline name
-    MockLoaderCls.assert_called_once_with(pipeline_name=pipeline_name)
+    MockLoaderCls.assert_called_once_with()
     assert MockPreparerCls.called, "InputPreparer should be instantiated"
 
     mock_create_app.assert_called_once_with(loader_instance, preparer_instance)
     app_mock.run.assert_called_once_with(host=host, port=int(port))
 
 
-# --- New ModelLoader Tests (Mocking ZenML) ---
+# --- ModelLoader (file based) ---
 
-@patch('src.main_api.Client')
-def test_modelLoader_load_success(MockClient):
-    """
-    Test that ModelLoader correctly interacts with the ZenML Client
-    to fetch the pipeline, run, and artifacts.
-    """
-    # 1. Setup the Mock Chain
-    mock_client_instance = MockClient.return_value
-    mock_pipeline = MagicMock()
-    mock_run = MagicMock()
-    mock_step_outputs = MagicMock()
-
-    # Artifact Mocks
-    mock_model_artifact = MagicMock()
-    mock_stats_artifact = MagicMock()
-
-    # The actual python objects returned by .load()
-    real_model_obj = DummyModel(num_classes=3)
-    real_stats_obj = [{"mean": 0.5, "std": 1.0}]
-
-    mock_model_artifact.load.return_value = real_model_obj
-    mock_stats_artifact.load.return_value = real_stats_obj
-
-    # Chain them together
-    mock_client_instance.get_pipeline.return_value = mock_pipeline
-    mock_pipeline.last_successful_run = mock_run
-
-    # Simulate the dictionary of outputs from the step
-    # Keys must match what is in main_api.py (run_training step)
-    mock_run.steps.__getitem__.return_value.outputs = {
-        "trained_model": mock_model_artifact,
-        "z_score_stats": mock_stats_artifact
-    }
-
-    # 2. Execute
-    loader = ModelLoader(pipeline_name="test_pipe", step_name="test_step")
-    loaded_model, loaded_stats = loader.load()
-
-    # 3. Assertions
-    assert isinstance(loaded_model, DummyModel)
-    assert loaded_stats == real_stats_obj
-
-    mock_client_instance.get_pipeline.assert_called_with("test_pipe")
-    mock_model_artifact.load.assert_called_once()
-    mock_stats_artifact.load.assert_called_once()
+@pytest.fixture
+def model_files(tmp_path, monkeypatch):
+    model_path = tmp_path / "models" / "mlp.ckpt"
+    stats_path = tmp_path / "models" / "processed" / "z.json"
+    monkeypatch.setattr(main_api.TrainingConfig, "model_path", str(model_path), raising=False)
+    monkeypatch.setattr(main_api.TrainingConfig, "stats_path", str(stats_path), raising=False)
+    return model_path, stats_path
 
 
-@patch('src.main_api.Client')
-def test_modelLoader_load_caching(MockClient):
-    """
-    Test that the loader caches the model and doesn't hit ZenML again
-    unless force_reload is True.
-    """
-    mock_client_instance = MockClient.return_value
-    mock_pipeline = MagicMock()
-    mock_run = MagicMock()
+def _save(model_path, stats_path, stats=None):
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.nn.Linear(2, 2), model_path)
+    if stats is not None:
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_path.write_text(json.dumps(stats))
 
-    mock_client_instance.get_pipeline.return_value = mock_pipeline
-    mock_pipeline.last_successful_run = mock_run
 
-    # Mock return values
-    mock_model_artifact = MagicMock()
-    mock_model_artifact.load.return_value = DummyModel()
-    mock_run.steps.__getitem__.return_value.outputs = {
-        "trained_model": mock_model_artifact,
-        "z_score_stats": MagicMock()  # stats
-    }
+def test_modelloader_missing_file(model_files):
+    with pytest.raises(FileNotFoundError):
+        ModelLoader().load()
 
+
+def test_modelloader_load_success(model_files):
+    stats = [{"device": "phone", "sensor": "accel", "mean": 0.5}]
+    _save(*model_files, stats=stats)
+    model, loaded_stats = ModelLoader().load()
+    assert isinstance(model, torch.nn.Linear)
+    assert loaded_stats == stats
+
+
+def test_modelloader_missing_stats_defaults_empty(model_files):
+    _save(*model_files)
+    _, stats = ModelLoader().load()
+    assert stats == []
+
+
+def test_modelloader_caching_and_force_reload(model_files):
+    _save(*model_files)
     loader = ModelLoader()
-
-    # First load
-    m1, s1 = loader.load()
-    assert MockClient.call_count == 1
-
-    # Second load (should be cached)
-    m2, s2 = loader.load()
-    assert MockClient.call_count == 1  # Still 1
+    m1, _ = loader.load()
+    m2, _ = loader.load()
     assert m1 is m2
-
-    # Force reload
-    m3, s3 = loader.load(force_reload=True)
-    assert MockClient.call_count == 2  # Increased
+    m3, _ = loader.load(force_reload=True)
+    assert m3 is not m1
 
 
 def test_input_preparer_stats():
     """Test that InputPreparer can hold and update stats."""
     prep = InputPreparer()
-    assert prep.z_score_stats == []
+    assert prep.z_score_dict == {}
 
-    new_stats = [{"col": "x", "mean": 10}]
-    prep.set_stats(new_stats)
-    assert prep.z_score_stats == new_stats
+    prep.set_stats([{"device": "phone", "sensor": "accel", "mean": 10}])
+    assert prep.z_score_dict == {("phone", "accel"): {"mean": 10}}
 
 
-def test_input_preparer_prepare():
-    prep = InputPreparer()
+def test_input_preparer_prepare(monkeypatch):
+    import polars as pl
+    prep = InputPreparer([{"device": "phone", "sensor": "accel", "mean": 0.0}])
 
-    # empty payload -> error
     with pytest.raises(ValueError):
         prep.prepare([])
 
-    # expanded features -> returns tensor
-    data = {"f0": 1.0, "f1": 2.0}
-    t = prep.prepare(data)
-    assert isinstance(t, torch.Tensor)
-    assert t.shape[0] == 1
-    assert t.shape[1] == 2
+    seen = {}
 
-    # Test dimension validation
-    model = SimpleNamespace()
-    # production code expects hparams as a dict; set it accordingly in the test
-    model.hparams = {'input_size': 1}  # Model expects 1 feature
+    def fake_expand(items, z_score):
+        seen["items"], seen["z"] = items, z_score
+        return pl.DataFrame({"x_0": [1.0], "y_0": [2.0], "label_A": [1]})
 
-    # Input has 2 features -> Should raise ValueError
-    with pytest.raises(ValueError) as excinfo:
-        prep.prepare(data, model=model)
-    assert "features but model expects 1" in str(excinfo.value)
+    monkeypatch.setattr(main_api, "expand_raw_items_to_expanded_df", fake_expand)
+    t = prep.prepare({"device": "phone"})
+
+    assert t.shape == (1, 2)  # label columns dropped
+    assert seen["items"] == [{"device": "phone"}]  # single dict wrapped in list
+    assert seen["z"] == prep.z_score_dict
 
 
 def test_predict_when_model_none_initially(monkeypatch):
@@ -275,21 +230,8 @@ def test_predict_when_model_none_initially(monkeypatch):
                 raise RuntimeError("no model yet")
             return self.model, []
 
-    # Avoid starting the real scheduler inside create_app during tests
-    class DummyScheduler:
-        def __init__(self):
-            pass
-        def add_job(self, *args, **kwargs):
-            pass
-        def start(self):
-            pass
-        def shutdown(self):
-            pass
-
-    monkeypatch.setattr('src.main_api.BackgroundScheduler', DummyScheduler)
-
     loader = FlakyLoader(DummyModel())
-    preparer = InputPreparer()
+    preparer = StubPreparer()
     app = create_app(loader, preparer)
     client = app.test_client()
 
@@ -302,44 +244,37 @@ def test_predict_when_model_none_initially(monkeypatch):
     assert isinstance(out, list) and len(out) == 1
 
 
-def test_train_endpoint_triggers_pipeline(monkeypatch):
-    """/train should return 202 and trigger the training pipeline in a background thread."""
-    # Avoid starting the real scheduler inside create_app during tests
-    class DummyScheduler:
-        def __init__(self):
-            pass
-        def add_job(self, *args, **kwargs):
-            pass
-        def start(self):
-            pass
-        def shutdown(self):
-            pass
+def _train_client():
+    return create_app(StubLoader(DummyModel()), InputPreparer()).test_client()
 
-    monkeypatch.setattr('src.main_api.BackgroundScheduler', DummyScheduler)
 
-    loader = StubLoader(DummyModel())
-    preparer = InputPreparer()
-    app = create_app(loader, preparer)
-    client = app.test_client()
+def test_train_triggers_airflow_dag():
+    token_resp = Mock(json=Mock(return_value={"access_token": "tok"}))
+    run_resp = Mock(ok=True, json=Mock(return_value={"dag_run_id": "r1"}))
+    with patch("main_api.requests.get", return_value=token_resp) as get, \
+            patch("main_api.requests.post", return_value=run_resp) as post:
+        r = _train_client().post("/train")
 
-    called = {"flag": False}
-
-    def fake_training_pipeline():
-        called["flag"] = True
-
-    # Patch the training_pipeline function so the background thread calls our fake
-    monkeypatch.setattr('src.main_api.training_pipeline', fake_training_pipeline)
-
-    r = client.get('/train')
     assert r.status_code == 202
-    j = r.get_json()
-    assert j["status"] == "Training started"
+    assert r.get_json()["airflow_response"] == {"dag_run_id": "r1"}
+    assert get.call_args.args[0].endswith("/auth/token")
+    url = post.call_args.args[0]
+    assert url.endswith("/api/v2/dags/wisdm_training/dagRuns")
+    assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
 
-    # wait briefly for the background thread to run the fake
-    import time
-    timeout = time.time() + 2.0
-    while not called["flag"] and time.time() < timeout:
-        time.sleep(0.01)
 
-    assert called["flag"] is True
+def test_train_airflow_rejects():
+    token_resp = Mock(json=Mock(return_value={"access_token": "tok"}))
+    run_resp = Mock(ok=False, text="boom")
+    with patch("main_api.requests.get", return_value=token_resp), \
+            patch("main_api.requests.post", return_value=run_resp):
+        r = _train_client().post("/train")
+    assert r.status_code == 502
+    assert r.get_json()["details"] == "boom"
 
+
+def test_train_airflow_unreachable():
+    with patch("main_api.requests.get", side_effect=ConnectionError("down")):
+        r = _train_client().post("/train")
+    assert r.status_code == 500
+    assert "down" in r.get_json()["error"]

@@ -44,7 +44,7 @@ def mock_preprocess(monkeypatch):
 
     mp.load_raw_data_from_local.return_value = mp_loader
     mp.raw_data_into_xyz_series.return_value = mp_loader
-    mp.convert_data_to_10_seconds_intervals.return_value = mp_loader
+    mp.convert_data_to_fixed_length_intervals.return_value = mp_loader
 
     monkeypatch.setitem(sys.modules, "src.preprocessing.preprocess", mp)
     monkeypatch.setattr(fake_client, "preprocess", mp, raising=False)

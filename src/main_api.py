@@ -13,12 +13,16 @@ from flask import request, jsonify, Flask, g
 from torch import nn
 import requests
 
+from configs.configs import TrainingConfig
 from main_training import LittleMLP
 from preprocessing.preprocess import expand_raw_items_to_expanded_df
 from prometheus_flask_exporter import PrometheusMetrics
 from prometheus_client import Counter, Histogram
 
 logging.basicConfig(level=logging.INFO)
+
+AIRFLOW_URL = os.getenv('AIRFLOW_URL', 'http://airflow:8080')
+AIRFLOW_DAG_ID = 'wisdm_training'
 
 
 
@@ -55,7 +59,7 @@ class ModelLoader:
             logging.info(f"Loading model from disk: {TrainingConfig.model_path}")
 
             try:
-                self._cached_model = torch.load(TrainingConfig.model_path, map_location=torch.device('cpu'))
+                self._cached_model = torch.load(TrainingConfig.model_path, map_location=torch.device('cpu'), weights_only=False)
                 self._cached_model.eval()
             except Exception as e:
                 logging.error(f"Failed to load model file: {e}")
@@ -182,17 +186,17 @@ def create_app(model_loader: ModelLoader, preparer: InputPreparer) -> Flask:
     @app.route("/train", methods=["POST", "GET"])
     def trigger_training():
         try:
+            token = requests.get(f"{AIRFLOW_URL}/auth/token", timeout=10).json()["access_token"]
             response = requests.post(
-                http://airflow:8080/api/v1/dags/training_pipeline/dagRuns,
-                json={"conf": {}},
-                auth=("admin", "admin")
+                f"{AIRFLOW_URL}/api/v2/dags/{AIRFLOW_DAG_ID}/dagRuns",
+                json={"logical_date": None},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
             )
-
-            if response.status_code == 200:
+            if response.ok:
                 return jsonify({"status": "Training triggered via Airflow",
                                 "airflow_response": response.json()}), HTTPStatus.ACCEPTED
-            else:
-                return jsonify({"error": "Failed to trigger Airflow", "details": response.text}), HTTPStatus.BAD_GATEWAY
+            return jsonify({"error": "Failed to trigger Airflow", "details": response.text}), HTTPStatus.BAD_GATEWAY
         except Exception as e:
             logging.error(f"Failed to reach Airflow: {e}")
             return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR

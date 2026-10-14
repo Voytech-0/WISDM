@@ -80,6 +80,8 @@ def load_raw_data_from_mysql() -> pl.LazyFrame:
     wait_for_mysql(engine, timeout=DataConfig.db_connect_timeout if hasattr(DataConfig, 'db_connect_timeout') else 30)
 
     query = "SELECT subject_id, label, timestamp, x, y, z, sensor, device FROM wisdm_raw"
+    if DataConfig.max_rows:
+        query += f" LIMIT {int(DataConfig.max_rows)}"
 
     chunk_size = int(getattr(DataConfig, 'db_read_chunk_size', 10000))
 

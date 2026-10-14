@@ -1,155 +1,52 @@
-import sys
-from unittest.mock import MagicMock, patch
-
-mock_zenml_client_module = MagicMock()
-sys.modules["zenml.client"] = mock_zenml_client_module
-
-mock_zenml_exceptions = MagicMock()
-
-
-class MockDoesNotExistException(Exception): pass
-
-
-mock_zenml_exceptions.DoesNotExistException = MockDoesNotExistException
-sys.modules["zenml.exceptions"] = mock_zenml_exceptions
-
-sys.modules["daily_pipeline"] = MagicMock()
-sys.modules["main_training"] = MagicMock()
-
-from main_api import create_app, ModelLoader, InputPreparer
 import pytest
-import json
 import torch
-import torch.nn as nn
 
-
-class MockModel(nn.Module):
-    def __init__(self, input_size=6, num_classes=2):
-        super().__init__()
-        self.input_size = input_size
-        self.linear = nn.Linear(input_size, num_classes)
-
-    def forward(self, x):
-        return self.linear(x)
+import main_api
+from main_api import create_app, ModelLoader
+from test_main_api import StubPreparer
+from main_training import LittleMLP
 
 
 @pytest.fixture
-def real_model_instance():
-    return MockModel(input_size=6)
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_api.TrainingConfig, "model_path", str(tmp_path / "mlp.ckpt"), raising=False)
+    monkeypatch.setattr(main_api.TrainingConfig, "stats_path", str(tmp_path / "z.json"), raising=False)
+    return create_app(ModelLoader(), StubPreparer()).test_client()
 
 
-@pytest.fixture
-def mock_zenml_client(real_model_instance):
-    mock_client_instance = MagicMock()
-    mock_pipeline = MagicMock()
-    mock_run = MagicMock()
-    mock_run.id = "test_run_123"
-
-    mock_step_outputs = {
-        "trained_model": MagicMock(),
-        "z_score_stats": MagicMock()
-    }
-
-    mock_step_outputs["trained_model"].load.return_value = real_model_instance
-
-    mock_step_outputs["z_score_stats"].load.return_value = [
-        {
-            "device": "device_1",
-            "sensor": "accel",
-            "feature_1_mean": 0.0,
-            "feature_1_std": 1.0
-        }
-    ]
-
-    mock_run.steps = {"run_training": MagicMock(outputs=mock_step_outputs)}
-    mock_pipeline.last_successful_run = mock_run
-    mock_client_instance.get_pipeline.return_value = mock_pipeline
-
-    return mock_client_instance
+def _save_model(path, num_classes=3):
+    torch.save(LittleMLP(input_size=2, hidden_size=4, num_layers=1, num_classes=num_classes, lr=0.01).eval(), path)
 
 
-@pytest.fixture
-def api_client(mock_zenml_client):
-    with patch("main_api.Client", return_value=mock_zenml_client), \
-            patch("main_api.BackgroundScheduler"), \
-            patch("main_api.PrometheusMetrics") as MockMetrics:
-        mock_metrics_instance = MagicMock()
-        MockMetrics.return_value = mock_metrics_instance
-        mock_metrics_instance.do_not_track.return_value = lambda func: func
-
-        loader = ModelLoader(pipeline_name="test_pipe", step_name="run_training")
-        preparer = InputPreparer()
-
-        app = create_app(loader, preparer)
-        app.config["TESTING"] = True
-
-        with app.test_client() as client:
-            yield client
+def test_health_unavailable_until_model_exists(client):
+    assert client.get("/health").status_code == 503
+    assert client.post("/predict", json=[{"a": 1.0, "b": 2.0}]).status_code == 500
 
 
-def test_app_startup_integration(api_client, mock_zenml_client):
-    response = api_client.get("/health")
-    assert response.status_code == 200
-    assert response.data.decode() == "OK"
+def test_reload_picks_up_model_written_by_training(client, tmp_path):
+    assert client.post("/reload").status_code == 500  # nothing trained yet
 
-    mock_zenml_client.get_pipeline.assert_called_with("test_pipe")
+    _save_model(tmp_path / "mlp.ckpt")
+    assert client.post("/reload").get_json() == {"status": "reloaded"}
+    assert client.get("/health").status_code == 200
 
-
-def test_predict_endpoint_flow(api_client):
-    pre_calculated_payload = [
-        {
-            "feature_1": 1.0, "feature_2": 0.5, "feature_3": 0.1,
-            "feature_4": 0.1, "feature_5": 0.1, "feature_6": 0.1
-        }
-    ]
-
-    response = api_client.post(
-        "/predict",
-        data=json.dumps(pre_calculated_payload),
-        content_type="application/json"
-    )
-
-    assert response.status_code == 200
-    data = response.get_json()
-    assert isinstance(data, list)
-    assert len(data) == 1
-    assert "pred" in data[0]
+    r = client.post("/predict", json=[{"a": 1.0, "b": 2.0}])
+    assert r.status_code == 200
+    assert len(r.get_json()[0]["probs"]) == 3
 
 
-def test_reload_endpoint_integration(api_client, mock_zenml_client):
-    initial_count = mock_zenml_client.get_pipeline.call_count
-
-    response = api_client.post("/reload")
-
-    assert response.status_code == 200
-    assert response.get_json() == {"status": "reloaded"}
-
-    assert mock_zenml_client.get_pipeline.call_count == initial_count + 1
+def test_reload_swaps_model(client, tmp_path):
+    _save_model(tmp_path / "mlp.ckpt", num_classes=3)
+    client.post("/reload")
+    _save_model(tmp_path / "mlp.ckpt", num_classes=2)
+    client.post("/reload")
+    r = client.post("/predict", json=[{"a": 1.0, "b": 2.0}])
+    assert len(r.get_json()[0]["probs"]) == 2
 
 
-@patch("main_api.training_pipeline")
-def test_train_trigger_integration(mock_training_pipeline, api_client):
-    response = api_client.get("/train")
-
-    assert response.status_code == 202
-    assert "Training started" in response.get_json()["status"]
-
-    import time
-    time.sleep(0.1)
-
-    from main_api import training_pipeline
-    training_pipeline.assert_called()
-
-
-def test_input_dimension_mismatch(api_client):
-    bad_payload = [{"f1": 1.0, "f2": 2.0}]
-
-    response = api_client.post(
-        "/predict",
-        data=json.dumps(bad_payload),
-        content_type="application/json"
-    )
-
-    assert response.status_code == 400
-    data = response.get_json()
-    assert "error" in data
+def test_input_dimension_mismatch(client, tmp_path):
+    _save_model(tmp_path / "mlp.ckpt")
+    client.post("/reload")
+    r = client.post("/predict", json=[{"f1": 1.0, "f2": 2.0, "f3": 3.0}])
+    assert r.status_code == 400
+    assert "error" in r.get_json()

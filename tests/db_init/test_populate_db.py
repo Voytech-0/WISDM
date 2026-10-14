@@ -152,15 +152,17 @@ def test_insert_using_load_data(monkeypatch):
     assert "INTO TABLE test_table" in sql
 
 
-def test_populate_already_populated(monkeypatch):
-    """Test populate returns early if status flag is present."""
-    monkeypatch.setattr(db_init.populate_db, "get_status_from_db", lambda k: '1')
-    monkeypatch.setattr(db_init.populate_db, "get_connected_engine", lambda timeout_s=120: MagicMock())
-    monkeypatch.setattr(db_init.populate_db, "create_status_table", lambda e: None)
+def test_populate_endpoint_already_populated(monkeypatch):
+    """/populate short-circuits when the status flag is set, without touching the DB."""
+    monkeypatch.setattr(db_init.populate_db, "is_populated", lambda: True)
+    mock_populate = MagicMock()
+    monkeypatch.setattr(db_init.populate_db, "populate", mock_populate)
 
-    success, reason = populate("dummy_path")
-    assert success is True
-    assert reason == "already_populated"
+    r = db_init.populate_db.app.test_client().get("/populate")
+
+    assert r.status_code == 200
+    assert r.get_json() == {"started": False, "populated": True, "reason": "already_populated"}
+    mock_populate.assert_not_called()
 
 
 def test_populate_success(monkeypatch, tmp_dir):
